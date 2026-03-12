@@ -1,6 +1,6 @@
 # Ticli
 
-A terminal music player for TIDAL. Search, browse, queue, and play music — all from your terminal.
+An unofficial terminal music player for TIDAL. Search, browse, queue, and play music — all from your terminal. Not affiliated with TIDAL.
 
 Ticli connects directly to TIDAL's API using your premium account. No desktop app needed. Just authenticate, search, and play.
 
@@ -119,10 +119,6 @@ Ticli uses [tidalapi](https://github.com/tamland/python-tidal) to authenticate a
 └─────────┘    metadata     └───────────┘                  └───────────┘
 ```
 
-### Auth & credentials
-
-OAuth tokens are stored in your OS keychain (macOS Keychain or GNOME Keyring). Falls back to `~/.config/ticli/session.json` with `0600` permissions if keyring is unavailable.
-
 ## Requirements
 
 - macOS or Linux
@@ -133,10 +129,6 @@ OAuth tokens are stored in your OS keychain (macOS Keychain or GNOME Keyring). F
 ## Support
 
 If you enjoy Ticli, consider [buying me a coffee](https://buymeacoffee.com/odonald).
-
-## Disclaimer
-
-This project is not affiliated with, endorsed by, or associated with TIDAL in any way. It is an independent, open-source tool that uses TIDAL's public API through your own premium account.
 
 ## License
 
