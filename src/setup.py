@@ -3,7 +3,7 @@
 from setuptools import find_packages, setup
 
 setup(
-    name="ticli",
+    name="tidal-cli",
     version="1.0.0",
     description="Ticli - Terminal music player for TIDAL",
     author="Ticli",

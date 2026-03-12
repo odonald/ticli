@@ -3,11 +3,30 @@ requires = ["setuptools>=64", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ticli"
+name = "tidal-cli"
 version = "1.0.0"
-description = "Ticli - Terminal music player for TIDAL"
+description = "Terminal music player for TIDAL — search, browse, queue, and stream lossless audio from your terminal"
 license = "MIT"
 requires-python = ">=3.10"
+readme = {file = "README.md", content-type = "text/markdown"}
+authors = [
+    {name = "odonald"},
+]
+keywords = ["tidal", "music", "terminal", "cli", "player", "tui", "streaming", "lossless", "hifi"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Multimedia :: Sound/Audio :: Players",
+]
 dependencies = [
     "click>=8.0",
     "rich>=13.0",
@@ -16,6 +35,12 @@ dependencies = [
 
 [project.optional-dependencies]
 keyring = ["keyring>=24.0"]
+
+[project.urls]
+Homepage = "https://github.com/odonald/ticli"
+Repository = "https://github.com/odonald/ticli"
+Issues = "https://github.com/odonald/ticli/issues"
+Funding = "https://buymeacoffee.com/odonald"
 
 [project.scripts]
 ticli = "ticli.cli:main"
