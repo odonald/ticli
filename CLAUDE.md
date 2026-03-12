@@ -1,0 +1,53 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Project Overview
+
+Ticli: a terminal music player for TIDAL. Streams lossless/hi-res audio directly from TIDAL's API via tidalapi + ffplay.
+
+## Repository Layout
+
+- `tidal-source/agent-harness/` — Python package (`ticli`)
+  - `ticli/tidal/headless_player.py` — Main player (TUI, audio, search, queue, playlists)
+  - `ticli/tidal/tidal_cli.py` — Click CLI entry point
+  - `ticli/tidal/utils/credential_store.py` — Secure OAuth token storage
+  - `ticli/tidal/tests/` — E2E tests
+
+## Commands
+
+```bash
+# Activate the Python environment
+source ./tidal-source/agent-harness/.venv/bin/activate
+
+# Install the package (editable)
+cd tidal-source/agent-harness && pip install -e ".[keyring]"
+
+# Run tests
+pytest ticli/tidal/tests/ -v
+
+# Launch the player
+ticli
+ticli --quality HIRES
+```
+
+## Architecture
+
+Ticli uses `tidalapi` (community Python client) to authenticate via OAuth and fetch audio stream URLs. Audio is played through ffplay (from ffmpeg). The TUI is built with Rich's `Live` display.
+
+### Audio Playback
+
+- ffplay: kills process on pause (instant silence), caches audio to local temp file, restarts from cache on resume
+- mpv (if available): uses IPC socket for pause/resume
+
+### Key Files
+
+| File | Purpose |
+|------|---------|
+| `headless_player.py` | Player TUI, audio control, search, queue, playlists (~1400 LOC) |
+| `tidal_cli.py` | CLI entry point |
+| `utils/credential_store.py` | OAuth token storage (keychain + fallback) |
+
+## Testing
+
+Tests use Click's `CliRunner` and subprocess calls to verify CLI help text and argument parsing. No running TIDAL instance needed.

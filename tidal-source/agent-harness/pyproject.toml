@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ticli"
+version = "1.0.0"
+description = "Ticli - Terminal music player for TIDAL"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = [
+    "click>=8.0",
+    "rich>=13.0",
+    "tidalapi>=0.8.0",
+]
+
+[project.optional-dependencies]
+keyring = ["keyring>=24.0"]
+
+[project.scripts]
+ticli = "ticli.tidal.tidal_cli:main"
+
+[tool.setuptools.packages.find]
+include = ["ticli.*"]
+
+[tool.pytest.ini_options]
+testpaths = ["ticli/tidal/tests"]

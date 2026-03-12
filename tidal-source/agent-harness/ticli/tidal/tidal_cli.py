@@ -1,0 +1,19 @@
+"""Ticli - Terminal music player for TIDAL."""
+
+import click
+
+
+@click.command()
+@click.option("--quality", default="HIGH", type=click.Choice(["LOW", "HIGH", "LOSSLESS", "HIRES"], case_sensitive=False), help="Audio quality")
+def cli(quality):
+    """Ticli - Terminal music player for TIDAL."""
+    from ticli.tidal.headless_player import HeadlessTidalPlayer
+    HeadlessTidalPlayer(quality=quality).run()
+
+
+def main():
+    cli()
+
+
+if __name__ == "__main__":
+    main()
