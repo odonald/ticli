@@ -4,7 +4,7 @@ from setuptools import find_packages, setup
 
 setup(
     name="tidal-cli",
-    version="1.0.0",
+    version="1.0.1",
     description="Ticli - Terminal music player for TIDAL",
     author="Ticli",
     license="MIT",

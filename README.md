@@ -134,6 +134,10 @@ OAuth tokens are stored in your OS keychain (macOS Keychain or GNOME Keyring). F
 
 If you enjoy Ticli, consider [buying me a coffee](https://buymeacoffee.com/odonald).
 
+## Disclaimer
+
+This project is not affiliated with, endorsed by, or associated with TIDAL in any way. It is an independent, open-source tool that uses TIDAL's public API through your own premium account.
+
 ## License
 
 MIT

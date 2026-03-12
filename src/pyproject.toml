@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tidal-cli"
-version = "1.0.0"
-description = "Terminal music player for TIDAL — search, browse, queue, and stream lossless audio from your terminal"
+version = "1.0.1"
+description = "Unofficial terminal music player for TIDAL — search, browse, queue, and stream lossless audio from your terminal. Not affiliated with TIDAL."
 license = "MIT"
 requires-python = ">=3.10"
 readme = {file = "README.md", content-type = "text/markdown"}
