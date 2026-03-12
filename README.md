@@ -48,7 +48,7 @@ sudo apt install ffmpeg
 
 # Then install Ticli
 git clone https://github.com/odonald/ticli.git
-cd ticli/tidal-source/agent-harness
+cd ticli/src
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[keyring]"
 ```

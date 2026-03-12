@@ -55,7 +55,7 @@ KEY_ENTER2 = "\n"
 KEY_BACKSPACE = "\x7f"
 KEY_BACKSPACE2 = "\x08"
 
-from ticli.tidal.utils.credential_store import save_tokens, load_tokens
+from ticli.utils.credential_store import save_tokens, load_tokens
 
 PAGE_SIZE = 15
 
@@ -385,7 +385,7 @@ class HeadlessTidalPlayer:
 
     def _logout(self):
         """Log out and clear saved tokens."""
-        from ticli.tidal.utils.credential_store import delete_tokens
+        from ticli.utils.credential_store import delete_tokens
         delete_tokens()
         self.audio.stop()
         self._playing = False
@@ -691,10 +691,22 @@ class HeadlessTidalPlayer:
             content.append(f"\n\n   {self._browse_message}", style="dim green")
         elif self._browse_tracks:
             total = len(self._browse_tracks)
-            page_start = (self._browse_cursor // PAGE_SIZE) * PAGE_SIZE
+            # browse_cursor -1 = "Play All" row, 0..N-1 = tracks
+            page_start = max(0, ((self._browse_cursor - 1) // PAGE_SIZE) * PAGE_SIZE) if self._browse_cursor > 0 else 0
             page_end = min(page_start + PAGE_SIZE, total)
             content.append(f"  ({total} tracks)", style="dim")
             content.append("\n", style="")
+
+            # "Play All" row (always visible when on first page)
+            if self._browse_cursor <= 0 or page_start == 0:
+                content.append("\n")
+                if self._browse_cursor == -1:
+                    content.append("  \u25b8 ", style="bold cyan")
+                    content.append("\u25b6 Play All", style="bold cyan")
+                else:
+                    content.append("    ", style="")
+                    content.append("\u25b6 Play All", style="dim green")
+
             for i in range(page_start, page_end):
                 track = self._browse_tracks[i]
                 content.append("\n")
@@ -708,7 +720,7 @@ class HeadlessTidalPlayer:
                     content.append(f"  {track.artists[0].name}", style="dim")
                 content.append(f"  {format_time(track.duration)}", style="dim cyan")
             if total > PAGE_SIZE:
-                page_num = (self._browse_cursor // PAGE_SIZE) + 1
+                page_num = (max(0, self._browse_cursor - 1) // PAGE_SIZE) + 1 if self._browse_cursor > 0 else 1
                 total_pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
                 content.append(f"\n\n   Page {page_num}/{total_pages}", style="dim")
 
@@ -846,6 +858,9 @@ class HeadlessTidalPlayer:
             controls.append(" search/open  ", style="dim")
             controls.append("[\u2191/\u2193]", style="bold")
             controls.append(" navigate  ", style="dim")
+            if self._search_results:
+                controls.append("[Space]", style="bold")
+                controls.append(" pause/play  ", style="dim")
             controls.append("[\u2190/Esc]", style="bold")
             controls.append(" back  ", style="dim")
             controls.append("[Bksp]", style="bold")
@@ -855,6 +870,8 @@ class HeadlessTidalPlayer:
             controls.append(" play track  ", style="dim")
             controls.append("[\u2191/\u2193]", style="bold")
             controls.append(" navigate  ", style="dim")
+            controls.append("[Space]", style="bold")
+            controls.append(" pause/play  ", style="dim")
             controls.append("[a]", style="bold")
             controls.append(" play all  ", style="dim")
             controls.append("[\u2190/Esc]", style="bold")
@@ -864,6 +881,8 @@ class HeadlessTidalPlayer:
             controls.append(" play  ", style="dim")
             controls.append("[\u2191/\u2193]", style="bold")
             controls.append(" navigate  ", style="dim")
+            controls.append("[Space]", style="bold")
+            controls.append(" pause/play  ", style="dim")
             controls.append("[x]", style="bold")
             controls.append(" remove  ", style="dim")
             controls.append("[\u2190/Esc]", style="bold")
@@ -873,6 +892,8 @@ class HeadlessTidalPlayer:
             controls.append(" open  ", style="dim")
             controls.append("[\u2191/\u2193]", style="bold")
             controls.append(" navigate  ", style="dim")
+            controls.append("[Space]", style="bold")
+            controls.append(" pause/play  ", style="dim")
             controls.append("[\u2190/Esc]", style="bold")
             controls.append(" back", style="dim")
 
@@ -1041,7 +1062,7 @@ class HeadlessTidalPlayer:
         self._mode = self.MODE_BROWSE
         self._browse_title = album.name
         self._browse_tracks = []
-        self._browse_cursor = 0
+        self._browse_cursor = -1
         self._browse_loading = True
         self._browse_message = ""
 
@@ -1063,7 +1084,7 @@ class HeadlessTidalPlayer:
         self._mode = self.MODE_BROWSE
         self._browse_title = f"{artist.name} - Top Tracks"
         self._browse_tracks = []
-        self._browse_cursor = 0
+        self._browse_cursor = -1
         self._browse_loading = True
         self._browse_message = ""
 
@@ -1120,7 +1141,7 @@ class HeadlessTidalPlayer:
         self._mode = self.MODE_BROWSE
         self._browse_title = playlist.name if hasattr(playlist, "name") else "Playlist"
         self._browse_tracks = []
-        self._browse_cursor = 0
+        self._browse_cursor = -1
         self._browse_loading = True
         self._browse_message = ""
 
@@ -1238,6 +1259,13 @@ class HeadlessTidalPlayer:
         if key == KEY_ESC or key == KEY_LEFT:
             self._go_back()
             return
+        if key == " " and self._search_results:
+            # Space toggles play/pause when browsing search results
+            if self._space_held:
+                return
+            self._toggle_play()
+            self._space_held = True
+            return
         if key == KEY_UP:
             if self._search_results:
                 self._search_cursor = max(0, self._search_cursor - 1)
@@ -1264,20 +1292,35 @@ class HeadlessTidalPlayer:
         if key == KEY_ESC or key == KEY_LEFT:
             self._go_back()
             return
+        if key == " ":
+            if self._space_held:
+                return
+            self._toggle_play()
+            self._space_held = True
+            return
         if key == KEY_UP:
             if self._browse_tracks:
-                self._browse_cursor = max(0, self._browse_cursor - 1)
+                self._browse_cursor = max(-1, self._browse_cursor - 1)
         elif key == KEY_DOWN:
             if self._browse_tracks:
                 self._browse_cursor = min(len(self._browse_tracks) - 1, self._browse_cursor + 1)
         elif key in (KEY_ENTER, KEY_ENTER2, KEY_RIGHT):
-            self._play_browse_track()
+            if self._browse_cursor == -1:
+                self._play_all_browse()
+            else:
+                self._play_browse_track()
         elif key == "a":
             self._play_all_browse()
 
     def _handle_queue_key(self, key: str):
         if key == KEY_ESC or key == KEY_LEFT:
             self._mode = self.MODE_PLAYER
+            return
+        if key == " ":
+            if self._space_held:
+                return
+            self._toggle_play()
+            self._space_held = True
             return
         if key == KEY_UP:
             if self._queue:
@@ -1294,6 +1337,12 @@ class HeadlessTidalPlayer:
     def _handle_playlists_key(self, key: str):
         if key == KEY_ESC or key == KEY_LEFT:
             self._mode = self.MODE_PLAYER
+            return
+        if key == " ":
+            if self._space_held:
+                return
+            self._toggle_play()
+            self._space_held = True
             return
         if key == KEY_UP:
             if self._playlists:

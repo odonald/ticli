@@ -18,10 +18,10 @@ dependencies = [
 keyring = ["keyring>=24.0"]
 
 [project.scripts]
-ticli = "ticli.tidal.tidal_cli:main"
+ticli = "ticli.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["ticli.*"]
 
 [tool.pytest.ini_options]
-testpaths = ["ticli/tidal/tests"]
+testpaths = ["ticli/tests"]

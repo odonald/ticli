@@ -20,7 +20,7 @@ setup(
     },
     entry_points={
         "console_scripts": [
-            "ticli=ticli.tidal.tidal_cli:main",
+            "ticli=ticli.cli:main",
         ],
     },
     classifiers=[

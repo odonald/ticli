@@ -36,20 +36,5 @@ Thumbs.db
 credentials.json
 session.json
 
-# Misc
-.eslintcache
-.gitmodules
-
-# TIDAL proprietary source and app bundle (not part of Ticli)
-TIDAL.app/
-tidal-source/app/
-tidal-source/node_modules/
-tidal-source/packages/
-tidal-source/resources/
-tidal-source/*.json
-tidal-source/*.js
-tidal-source/*.bin
-tidal-source/*.p12
-
 # Claude Code
 .claude/

@@ -8,23 +8,23 @@ Ticli: a terminal music player for TIDAL. Streams lossless/hi-res audio directly
 
 ## Repository Layout
 
-- `tidal-source/agent-harness/` — Python package (`ticli`)
-  - `ticli/tidal/headless_player.py` — Main player (TUI, audio, search, queue, playlists)
-  - `ticli/tidal/tidal_cli.py` — Click CLI entry point
-  - `ticli/tidal/utils/credential_store.py` — Secure OAuth token storage
-  - `ticli/tidal/tests/` — E2E tests
+- `src/` — Python package (`ticli`)
+  - `ticli/player.py` — Main player (TUI, audio, search, queue, playlists)
+  - `ticli/cli.py` — Click CLI entry point
+  - `ticli/utils/credential_store.py` — Secure OAuth token storage
+  - `ticli/tests/` — E2E tests
 
 ## Commands
 
 ```bash
 # Activate the Python environment
-source ./tidal-source/agent-harness/.venv/bin/activate
+source ./src/.venv/bin/activate
 
 # Install the package (editable)
-cd tidal-source/agent-harness && pip install -e ".[keyring]"
+cd src && pip install -e ".[keyring]"
 
 # Run tests
-pytest ticli/tidal/tests/ -v
+pytest ticli/tests/ -v
 
 # Launch the player
 ticli
@@ -44,8 +44,8 @@ Ticli uses `tidalapi` (community Python client) to authenticate via OAuth and fe
 
 | File | Purpose |
 |------|---------|
-| `headless_player.py` | Player TUI, audio control, search, queue, playlists (~1400 LOC) |
-| `tidal_cli.py` | CLI entry point |
+| `player.py` | Player TUI, audio control, search, queue, playlists (~1400 LOC) |
+| `cli.py` | CLI entry point |
 | `utils/credential_store.py` | OAuth token storage (keychain + fallback) |
 
 ## Testing

@@ -11,7 +11,7 @@ import sys
 import pytest
 from click.testing import CliRunner
 
-from ticli.tidal.tidal_cli import cli
+from ticli.cli import cli
 
 
 class TestCLIHelp:
@@ -56,7 +56,7 @@ class TestCLISubprocess:
         if exe:
             cmd = [exe] + args
         else:
-            cmd = [sys.executable, "-m", "ticli.tidal.tidal_cli"] + args
+            cmd = [sys.executable, "-m", "ticli.cli"] + args
         return subprocess.run(cmd, capture_output=True, text=True, timeout=10, **kwargs)
 
     def test_help_exit_code(self):
