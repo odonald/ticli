@@ -37,17 +37,6 @@ Works on **macOS** and **Linux**.
 
 ## Install
 
-### Homebrew (macOS / Linux)
-
-```bash
-brew tap odonald/ticli
-brew install ticli
-```
-
-This installs Ticli, Python, and ffmpeg in one shot.
-
-### Manual
-
 Requires Python 3.10+ and [ffmpeg](https://ffmpeg.org).
 
 ```bash
