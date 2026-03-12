@@ -21,7 +21,7 @@ keyring = ["keyring>=24.0"]
 ticli = "ticli.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["ticli.*"]
+include = ["ticli", "ticli.*"]
 
 [tool.pytest.ini_options]
 testpaths = ["ticli/tests"]
