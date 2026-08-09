@@ -1189,6 +1189,81 @@ def _find_audio_player():
     return None
 
 
+def _instance_lock_path() -> Path:
+    """Where the one-at-a-time lock lives.
+
+    Derived at call time rather than bound at import, so redirecting
+    `STATE_DIR` redirects this with it — the same reason `download_dir()`
+    reads `DOWNLOAD_ROOT` when it is called.
+    """
+    return STATE_DIR / "instance.lock"
+
+
+def _read_lock_pid(fd: int) -> int:
+    """The pid the lock holder wrote, or 0 if it cannot be read.
+
+    Only ever used to make the refusal message specific. Nothing depends on
+    it being right — the lock itself is the mechanism.
+    """
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        return int(os.read(fd, 32).decode().strip() or 0)
+    except (OSError, ValueError, UnicodeDecodeError):
+        return 0
+
+
+def _take_instance_lock():
+    """Try to become the one running ticli.
+
+    Returns `(fd, other)`. `other` is not None exactly when another instance
+    holds the lock — the pid it recorded, or 0 if that could not be read —
+    and that is the only case where the caller must refuse to start. `fd` is
+    the descriptor holding the lock; it stays open for the life of the
+    process, because closing it is what drops the lock.
+
+    An advisory `flock`, deliberately not the pid file BUGS-2026-07-24 item 8
+    proposed. The kernel releases a flock when the holder dies — SIGKILL, a
+    closed terminal, a power cut — so there is no stale lock to detect and no
+    recycled pid to misjudge, which is the entire failure mode of pid files
+    and the reason this needs no cleanup path at all.
+
+    When locking cannot be *evaluated* — no `fcntl`, or a filesystem that
+    refuses to take one, which is the NFS home directory case — this returns
+    `(None, None)` and ticli starts exactly as it did before. The guard is
+    here to catch an honest mistake, and it must never be the thing that
+    stops the owner playing his music.
+    """
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - POSIX only, and Windows cannot start anyway
+        return None, None
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd = os.open(_instance_lock_path(), os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as e:
+        logger.debug("No instance lock (%s); starting anyway", e)
+        return None, None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        # Somebody has it. This is the one case worth stopping for.
+        other = _read_lock_pid(fd)
+        os.close(fd)
+        return None, other
+    except OSError as e:
+        # We could not ask the question; do not stand in the way of an answer
+        # we never got.
+        logger.debug("Instance lock unavailable (%s); starting anyway", e)
+        os.close(fd)
+        return None, None
+    try:
+        os.ftruncate(fd, 0)
+        os.write(fd, f"{os.getpid()}\n".encode())
+    except OSError:
+        pass  # the pid is a courtesy for the message, never the mechanism
+    return fd, None
+
+
 class AudioPlayer:
     """Manages audio playback via external player (mpv or ffplay).
 
@@ -1531,63 +1606,88 @@ class AudioPlayer:
         user deleted by hand falls straight through to the network, which is
         the whole of "handled durably" on this path.
         """
-        self.stop()
         with self._lock:
-            self._paused = False
-            self._current_url = url
-            self._media_title = title
-            self._media_keys_bound = False
-            self._seek_offset = seek
-            self._play_start = time.time()
-            kept = local if (local and os.path.exists(local)) else \
-                self._cached_audio_path(cache_key)
-            # A track played before is already whole on disk: play the file and
-            # never touch the network. Works on both backends, because only the
-            # source path changes.
-            have_kept = bool(kept) and os.path.exists(kept)
-            source = kept if have_kept else url
-            self._cache_persistent = have_kept
-            if have_kept:
-                self._cache_file = kept
-            segmented = source.endswith(HLS_SUFFIX)
-            if self.player_cmd == "mpv":
-                self._ipc_path = f"/tmp/ticli-mpv-{os.getpid()}.sock"
-                try:
-                    os.unlink(self._ipc_path)
-                except OSError:
-                    pass
-                cmd = [
-                    "mpv", "--no-video",
-                    # Not --really-quiet: that is what made a stream mpv
-                    # could not decode look exactly like one it could
-                    "--msg-level=all=error",
-                    f"--input-ipc-server={self._ipc_path}",
-                    # --volume-max first: mpv refuses anything above it, and
-                    # its default ceiling (130) is below what the setting allows
-                    f"--volume-max={VOLUME_MAX}",
-                    f"--volume={self.volume}",
-                ]
-                if segmented:
-                    cmd += self._hls_flags()
-                if seek > 0:
-                    cmd.append(f"--start={seek}")
-                cmd.append(source)
-            else:  # ffplay
-                self._ipc_path = None
-                # Plays from `source`: a kept file when there is one, the URL
-                # otherwise — a download that has only just started can't
-                # satisfy a seek yet
-                cmd = self._ffplay_cmd(source, seek)
-            self._process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=self._open_stderr(),
-            )
-            gen = self._download_gen
+            have_kept, gen = self._play_url_locked(
+                url, seek, title, cache_key, local)
         # Off the lock and off this thread: fetching the track must never hold
         # up the process that is playing it
         if not have_kept:
             self._start_download(url, cache_key, gen, quality=quality)
+
+    def _play_url_locked(self, url: str, seek: float = 0,
+                         title: Optional[str] = None, cache_key=None,
+                         local: Optional[str] = None):
+        """play_url's body, for callers already holding self._lock.
+
+        Kills the previous backend and spawns the new one inside a *single*
+        acquisition. This used to be `stop()` — which takes the lock, reaps,
+        and releases — followed by a second `with self._lock:` around the
+        spawn, and the instant between the two was a real bug: a second
+        starter arriving there found `_process` already None, reaped nothing,
+        and spawned on top. Both processes then played, and only the last one
+        was reachable — `_process` is the sole handle anything stops, pauses or
+        seeks, and mpv's IPC socket is one fixed path per ticli pid that the
+        last spawn takes over. The loser kept making sound, ignored the space
+        bar, and outlived the app.
+
+        `self._lock` is a plain, non-reentrant Lock, so a caller holding it
+        cannot call `stop()` at all; the unlocked `_locked` half is the shape
+        ai/WORKING-RULES.md prescribes for exactly this, and the one `seek_to`
+        has always had. Returns (have_kept, gen) so the caller can start the
+        download after releasing.
+        """
+        self._stop_locked()
+        self._paused = False
+        self._current_url = url
+        self._media_title = title
+        self._media_keys_bound = False
+        self._seek_offset = seek
+        self._play_start = time.time()
+        kept = local if (local and os.path.exists(local)) else \
+            self._cached_audio_path(cache_key)
+        # A track played before is already whole on disk: play the file and
+        # never touch the network. Works on both backends, because only the
+        # source path changes.
+        have_kept = bool(kept) and os.path.exists(kept)
+        source = kept if have_kept else url
+        self._cache_persistent = have_kept
+        if have_kept:
+            self._cache_file = kept
+        segmented = source.endswith(HLS_SUFFIX)
+        if self.player_cmd == "mpv":
+            self._ipc_path = f"/tmp/ticli-mpv-{os.getpid()}.sock"
+            try:
+                os.unlink(self._ipc_path)
+            except OSError:
+                pass
+            cmd = [
+                "mpv", "--no-video",
+                # Not --really-quiet: that is what made a stream mpv
+                # could not decode look exactly like one it could
+                "--msg-level=all=error",
+                f"--input-ipc-server={self._ipc_path}",
+                # --volume-max first: mpv refuses anything above it, and
+                # its default ceiling (130) is below what the setting allows
+                f"--volume-max={VOLUME_MAX}",
+                f"--volume={self.volume}",
+            ]
+            if segmented:
+                cmd += self._hls_flags()
+            if seek > 0:
+                cmd.append(f"--start={seek}")
+            cmd.append(source)
+        else:  # ffplay
+            self._ipc_path = None
+            # Plays from `source`: a kept file when there is one, the URL
+            # otherwise — a download that has only just started can't
+            # satisfy a seek yet
+            cmd = self._ffplay_cmd(source, seek)
+        self._process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=self._open_stderr(),
+        )
+        return have_kept, self._download_gen
 
     def _ffplay_cmd(self, source: str, seek: float) -> list:
         """How ffplay is asked to play `source` from `seek`.
@@ -1625,6 +1725,15 @@ class AudioPlayer:
             self._process.wait(timeout=2)
         except subprocess.TimeoutExpired:
             self._process.kill()
+            try:
+                # SIGKILL is unblockable, but the reap is not finished until
+                # the child has been waited for — and the caller is about to
+                # drop the last handle that could ever collect it. Without
+                # this it stays a zombie for the life of the session.
+                self._process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                logger.warning("audio process %s survived SIGKILL",
+                               getattr(self._process, "pid", "?"))
 
     def pause(self):
         """Pause playback."""
@@ -1653,6 +1762,7 @@ class AudioPlayer:
 
     def resume(self) -> bool:
         """Resume paused playback. False if it failed (e.g. player died)."""
+        download = None
         with self._lock:
             if not self._paused:
                 return False
@@ -1661,23 +1771,26 @@ class AudioPlayer:
                     self._paused = False
                     return True
                 return False
-            else:
-                # ffplay: restart from cached local file (instant, no network)
-                if self._cache_file and os.path.exists(self._cache_file):
-                    self._play_from_cache(self._seek_offset)
-                    return True
-                elif self._current_url:
-                    # Cache not ready — fall back to URL
-                    self._paused = False
-                    url = self._current_url
-                    seek = self._seek_offset
-                    self._lock.release()
-                    try:
-                        self.play_url(url, seek=seek)
-                    finally:
-                        self._lock.acquire()
-                    return True
-            return False
+            # ffplay: restart from cached local file (instant, no network)
+            if self._cache_file and os.path.exists(self._cache_file):
+                self._play_from_cache(self._seek_offset)
+                return True
+            if not self._current_url:
+                return False
+            # Cache not ready — fall back to URL. This used to release the
+            # lock by hand to call play_url and re-acquire afterwards, which
+            # is the same seam as the one _play_url_locked exists to close,
+            # reached by pressing space on ffplay before the copy is ready.
+            url = self._current_url
+            seek = self._seek_offset
+            self._paused = False
+            have_kept, gen = self._play_url_locked(url, seek)
+            if not have_kept:
+                download = (url, None, gen)
+        # Off the lock, exactly as play_url does it
+        if download:
+            self._start_download(*download)
+        return True
 
     def _mpv_request(self, cmd: dict, timeout: float = 0.5) -> Optional[dict]:
         """Send a JSON IPC command to mpv and return its reply, or None."""
@@ -1838,32 +1951,45 @@ class AudioPlayer:
     def stop(self):
         """Stop current playback."""
         with self._lock:
-            # Any download still running is for a track we are leaving: this
-            # is what tells it to abandon itself and clean up its .part
-            self._download_gen += 1
-            if self._process and self._process.poll() is None:
+            self._stop_locked()
+
+    def _stop_locked(self):
+        """stop()'s body, for callers already holding self._lock.
+
+        Split out for `_play_url_locked`, which must reap and respawn without
+        ever handing the lock back — see the note there for what the gap cost.
+        """
+        # Any download still running is for a track we are leaving: this
+        # is what tells it to abandon itself and clean up its .part
+        self._download_gen += 1
+        if self._process:
+            if self._process.poll() is None:
                 self._reap_process()
-                self._process = None
-            # A kept track is the whole point of having cached it; a scratch
-            # copy existed only to resume this one, so it goes.
-            if self._cache_file and not self._cache_persistent:
-                try:
-                    os.unlink(self._cache_file)
-                except OSError:
-                    pass
-            self._cache_file = None
-            self._cache_persistent = False
-            self._paused = False
-            self._play_start = None
-            self._seek_offset = 0
-            self._media_keys_bound = False
-            # Clean up mpv socket
-            if self._ipc_path:
-                try:
-                    os.unlink(self._ipc_path)
-                except OSError:
-                    pass
-                self._ipc_path = None
+            # Cleared even when it had already exited: a dead handle left here
+            # is not a process, it is a stale answer. `failure()` reads it, so
+            # keeping it meant a stream the backend had refused went on
+            # reporting its error after we stopped the track.
+            self._process = None
+        # A kept track is the whole point of having cached it; a scratch
+        # copy existed only to resume this one, so it goes.
+        if self._cache_file and not self._cache_persistent:
+            try:
+                os.unlink(self._cache_file)
+            except OSError:
+                pass
+        self._cache_file = None
+        self._cache_persistent = False
+        self._paused = False
+        self._play_start = None
+        self._seek_offset = 0
+        self._media_keys_bound = False
+        # Clean up mpv socket
+        if self._ipc_path:
+            try:
+                os.unlink(self._ipc_path)
+            except OSError:
+                pass
+            self._ipc_path = None
 
     def source_vanished(self) -> bool:
         """True when the cached file we were playing has been deleted out from
@@ -2045,6 +2171,11 @@ class HeadlessTidalPlayer:
         # whole (temp + rename), so a reader sees one generation of it, never
         # a torn one.
         self._state_lock = threading.Lock()
+        # The one-at-a-time lock, taken in run(). Held open for the life of
+        # the process on purpose: closing this descriptor is what releases it,
+        # so it is never closed — the kernel does it at exit, which is also
+        # what makes a crash release it.
+        self._instance_lock_fd: Optional[int] = None
         self._liked_ids: set = set()
         # Track radio: a fetch is in flight, and when the last one started
         self._radio_fetching = False
@@ -8748,6 +8879,23 @@ class HeadlessTidalPlayer:
 
     def run(self):
         """Start the headless player."""
+        # One ticli at a time, decided before anything else touches the
+        # config directory, the cache tracker or the audio backend. Two
+        # instances is the other way the owner's "a primary song playing and
+        # another song playing at that same time" happens (INCIDENTS #7 is
+        # the in-process route), and they also take turns overwriting the
+        # same saved position — BUGS-2026-07-24 item 8, the half that the
+        # atomic write did not cover.
+        self._instance_lock_fd, other = _take_instance_lock()
+        if other is not None:
+            named = f" (pid {other})" if other else ""
+            self.console.print(
+                f"[red]ticli is already running{named}.[/red]\n"
+                "Only one copy can run at a time: two play over each other, "
+                "and each one's saved position overwrites the other's.\n"
+                "Quit the running copy first, or use the terminal it is in.")
+            return
+
         # Find audio player
         player_cmd = _find_audio_player()
         if not player_cmd:
