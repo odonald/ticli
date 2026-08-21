@@ -6,10 +6,7 @@ Ticli connects directly to TIDAL's API using your premium account. No desktop ap
 
 Works on **macOS** and **Linux**.
 
-```
 <img width="1350" height="1082" alt="image" src="https://github.com/user-attachments/assets/93aaa46d-7340-4fc2-8e07-26f7dd287ddd" />
-
-```
 
 ## Features
 
@@ -28,7 +25,9 @@ Works on **macOS** and **Linux**.
 
 ## Install
 
-Requires Python 3.10+ and [mpv](https://mpv.io).
+Requires Python 3.10+ and [mpv](https://mpv.io). No mpv? ffplay (part of
+[ffmpeg](https://ffmpeg.org)) works as a fallback — playback, pause, and
+seeking all function; you lose the macOS media keys and volume above 100%.
 
 ```bash
 # macOS
@@ -113,7 +112,7 @@ Separately from downloads, ticli keeps a bounded on-disk cache (2 GB by default,
 
 ## How it works
 
-Ticli uses [tidalapi](https://github.com/tamland/python-tidal) to authenticate (device or PKCE OAuth) and fetch stream manifests. Audio plays through [mpv](https://mpv.io) — which on macOS is also what powers the media keys and Now Playing. Hi-res DASH streams arrive as segments and are stitched into a local playlist mpv reads natively. The TUI is [Rich](https://github.com/Textualize/rich), repainting only when something actually changed — an idle player costs roughly zero CPU and zero network.
+Ticli uses [tidalapi](https://github.com/tamland/python-tidal) to authenticate (device or PKCE OAuth) and fetch stream manifests. Audio plays through [mpv](https://mpv.io) — or ffplay, if mpv isn't installed — and on macOS mpv is also what powers the media keys and Now Playing. Hi-res DASH streams arrive as segments and are stitched into a local playlist mpv reads natively. The TUI is [Rich](https://github.com/Textualize/rich), repainting only when something actually changed — an idle player costs roughly zero CPU and zero network.
 
 ```
 ┌─────────┐     OAuth      ┌───────────┐    stream URL    ┌───────────┐
@@ -149,7 +148,7 @@ where.
 - macOS or Linux
 - Python 3.10+
 - TIDAL Premium subscription
-- mpv
+- mpv (or ffmpeg's ffplay)
 
 ## Credits
 
