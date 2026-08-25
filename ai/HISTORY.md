@@ -1517,3 +1517,79 @@ and it is noted in the file rather than silently left.
 Suite: 1,467 → 1,480 (13 new; one asserts the conftest rail itself). Verified
 stable across 20 consecutive runs of both new files and three full runs, plus
 an end-to-end check with two real processes.
+
+## 2026-08-25 — the agent surface: `ticli agent`, throttle in code
+
+### (this branch) Agents as first-class callers, with the brakes moved out of Markdown
+
+**Why now, and why shaped like this.** During a chat session, an agent built
+the owner a playlist by importing ticli's internals and firing ~30 search and
+playlist requests in a few seconds — in direct violation of the 15-second rule
+in WORKING-RULES.md, which it had not read before acting. Nothing tripped this
+time, but the agent that got the owner's IP blocked did the same thing with
+less luck. The owner's response: *"I would like to make agents interacting
+with this program a first-class feature."* The session's own mistakes became
+the spec — each pain point mapped to a primitive (see DECISIONS for the spec
+and what was deliberately deferred).
+
+**Built:**
+
+- **`utils/throttle.py`** — cross-process request spacing via a reservation
+  pattern (flock'd read-claim-write, then sleep *outside* the lock, so N
+  processes serialize into spaced slots instead of stampeding). 2.0s between
+  agent requests — double the TUI's 1.0s interactive floor, because agents
+  are unattended. A 429 or 401/subStatus-4006 writes a **trip record**; from
+  then on every agent call fails fast with a structured error until a human
+  runs `ticli agent unblock`. Nothing clears it automatically, because the
+  working rule is *stop entirely and report* — retries extend blocks. First
+  trip wins: a racing second failure must not overwrite the original evidence.
+- **`agent.py`** — the verbs. `status` (zero requests by default; `--verify`
+  spends one), `search`, `resolve`, `playlist list/show/create/add`,
+  `unblock`. stdout is always exactly one JSON object; errors are structured
+  (`not_logged_in`, `rate_limited`, `auth_failed`, `api_error`) with hints and
+  nonzero exits. The session bootstrap is the blessed path the TUI uses —
+  `is_pkce` surviving into `load_oauth_session`, refreshed tokens saved back.
+- **`resolve`** — the hard-won piece. The playlist session's scorer had a
+  remix penalty (-3) that rivaled its artist bonus (+4), and served "The
+  Journey" by H.E.R. for Folamour's. The rules that came out of that:
+  **artist is a gate, not a score** (a wrong-artist candidate can never
+  outrank a right-artist one, structurally); unrequested version qualifiers
+  (remix/edit/live/…) demote within the gate but still resolve when they are
+  all there is — reported, never silently served; `feat.` credits are
+  stripped before comparison because a featured guest is the same recording
+  (that assumption is what buried the real Folamour original); `confident` is
+  strict and everything less returns the ranked list for the caller to judge.
+- **`cli.py`** became a `click.Group` with `invoke_without_command=True` —
+  bare `ticli` is byte-for-byte the player it always was, and `ticli agent
+  --help` stays instant (~60ms) because agent.py never imports player.py and
+  defers tidalapi into the functions.
+- **conftest rail first**: `throttle.STATE_DIR` is redirected suite-wide in
+  the same autouse fixture as player's, per the instance-lock lesson.
+
+**Rejected:**
+
+- *Sleep under the flock* — would hold the lock across a wait and a network
+  call; the reservation pattern gets the same serialization without that.
+- *Auto-expiring the trip* — a wrong guess costs the owner's music, so
+  clearing is a human's decision (`unblock`), full stop.
+- *`--json` as a flag* — the agent surface has no human output mode to
+  toggle away from; stdout is JSON, stderr is for people, one contract.
+- *Importing player's `STATE_DIR`/`_instance_lock_path`* — the import chain
+  is the whole TUI. The path is rebuilt and **kept in step by a test rather
+  than an import** (the cli.py QUALITY_NAMES precedent): the test takes the
+  lock via `player._take_instance_lock()` and asserts `_player_running()`
+  sees it.
+
+**Verified:** suite 1,488 → 1,505 (17 new). Mutation-checked per the
+watch-it-fail rule: dropping the artist gate, unhooking the throttle from the
+request path, and keeping a trip in memory only each made the corresponding
+test fail before restore. Live smoke test: `agent status` against the real
+store reported the owner's PKCE session and `player_running: true` while his
+TUI held the lock — zero requests spent.
+
+**Known and not done:** the stale `.venv/bin/ticli` entry script predates this
+work (`ModuleNotFoundError`; the editable finder points elsewhere — re-run
+`pip install -e .` to refresh). The `search`/`resolve` verbs account only the
+requests they make; tidalapi's own token-refresh round trip is not separately
+throttled. Live-player control and an MCP layer were deferred by the owner's
+choice, not overlooked — see DECISIONS.

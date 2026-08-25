@@ -17,6 +17,13 @@ stop making requests entirely and report.** Never retry. Retries extend these
 blocks.
 
 Practical consequences that shaped features:
+- **Interacting with ticli's data at runtime (search, playlists, status):
+  use `ticli agent <verb>`, never a hand-rolled script over the internals.**
+  The agent surface (2026-08-25, built because an agent did exactly that and
+  fired ~30 unthrottled requests) enforces these rate rules in code — spacing
+  between requests, and a hard stop on 429/4006 that only a human clears.
+  A script that imports `credential_store` and calls tidalapi directly
+  bypasses all of it and is how the IP block happened.
 - Build against fakes. Read the installed `tidalapi` source
   (`~/.local/pipx/venvs/tidal-cli/lib/python3.14/site-packages/tidalapi/`)
   instead of probing. Several agents completed substantial features with

@@ -38,13 +38,107 @@ class QualityChoice(click.Choice):
         return super().convert(name, param, ctx)
 
 
-@click.command()
+@click.group(invoke_without_command=True)
 @click.option("--quality", default=None, type=QualityChoice(QUALITY_NAMES, case_sensitive=False), help="Audio quality for this run (overrides the saved setting)")
 @click.option("--login-flow", default=None, type=click.Choice(["device", "pkce"], case_sensitive=False), help="How to log in when there is no saved session. device (default) is quickest; pkce needs a paste but is the only flow TIDAL streams FLAC to. Settings can switch later.")
-def cli(quality, login_flow):
-    """Ticli - Terminal music player for TIDAL."""
+@click.pass_context
+def cli(ctx, quality, login_flow):
+    """Ticli - Terminal music player for TIDAL.
+
+    Plain `ticli` runs the player, exactly as it always has; the group
+    exists only so `ticli agent` can hang off it without the player's
+    import chain slowing `--help` down.
+    """
+    if ctx.invoked_subcommand is not None:
+        return
     from ticli.player import HeadlessTidalPlayer
     HeadlessTidalPlayer(quality=quality, login_flow=login_flow).run()
+
+
+@cli.group()
+def agent():
+    """Headless verbs for programs. stdout is always one JSON object.
+
+    Every verb is rate-limited by a cross-process throttle; a TIDAL 429 or
+    bot-detection response stops ALL agent requests until a human runs
+    `ticli agent unblock`. Errors are structured: {"ok": false, "error":
+    <code>, "message": ..., "hint": ...} with a nonzero exit.
+    """
+
+
+@agent.command()
+@click.option("--verify", is_flag=True, help="Spend one request confirming the session works. Default is zero requests.")
+def status(verify):
+    """Session, entitlement, player and throttle state. Costs 0 requests (1 with --verify)."""
+    from ticli import agent as impl
+    impl.status(verify)
+
+
+@agent.command()
+@click.argument("query")
+@click.option("--type", "types", multiple=True, type=click.Choice(["track", "album", "artist", "playlist"]), help="Repeatable. Default: track.")
+@click.option("--limit", default=10, show_default=True, help="Results per type.")
+def search(query, types, limit):
+    """Search TIDAL. Costs 1 request regardless of how many --type."""
+    from ticli import agent as impl
+    impl.search(query, types, limit)
+
+
+@agent.command()
+@click.option("--artist", required=True)
+@click.option("--title", required=True)
+@click.option("--limit", default=10, show_default=True, help="Candidates to rank.")
+def resolve(artist, title, limit):
+    """Find THE track for an artist+title: ranked candidates, a best pick,
+    and a strict `confident` flag. Costs 1 request."""
+    from ticli import agent as impl
+    impl.resolve(artist, title, limit)
+
+
+@agent.group()
+def playlist():
+    """Your playlists: list, show, create, add."""
+
+
+@playlist.command("list")
+def playlist_list():
+    """All of your playlists. Costs 1 request."""
+    from ticli import agent as impl
+    impl.playlist_list()
+
+
+@playlist.command("show")
+@click.argument("playlist_id")
+def playlist_show(playlist_id):
+    """A playlist and its tracks. Costs 2 requests."""
+    from ticli import agent as impl
+    impl.playlist_show(playlist_id)
+
+
+@playlist.command("create")
+@click.argument("name")
+@click.option("--description", default="", help="Optional description.")
+def playlist_create(name, description):
+    """Create an empty playlist. Costs 1 request."""
+    from ticli import agent as impl
+    impl.playlist_create(name, description)
+
+
+@playlist.command("add")
+@click.argument("playlist_id")
+@click.argument("track_ids", nargs=-1, required=True)
+def playlist_add(playlist_id, track_ids):
+    """Add tracks by id. One add is one request however many ids. Costs 2 requests."""
+    from ticli import agent as impl
+    impl.playlist_add(playlist_id, track_ids)
+
+
+@agent.command()
+def unblock():
+    """Clear a tripped rate-limit stop. For humans, after investigating —
+    an agent must never run this."""
+    from ticli import agent as impl
+    impl.unblock()
 
 
 def main():

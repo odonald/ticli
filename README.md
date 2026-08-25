@@ -110,6 +110,38 @@ The names follow TIDAL's own app — `MEDIUM` is the 320k option TIDAL files und
 
 Separately from downloads, ticli keeps a bounded on-disk cache (2 GB by default, budget adjustable in settings) so repeat plays cost no data at all.
 
+## Agents
+
+`ticli agent` is the surface for callers that are programs — an AI assistant
+building you a playlist, a script checking what's playing. Everything under it
+speaks JSON on stdout, exactly one object per invocation, with structured
+errors and a nonzero exit when something's wrong. No screen-scraping, no
+importing internals.
+
+```bash
+ticli agent status                                  # session, FLAC entitlement, player state — costs 0 requests
+ticli agent search "four tet baby" --type track     # 1 request
+ticli agent resolve --artist Folamour --title "The Journey"
+ticli agent playlist create "Morning Uplift"
+ticli agent playlist add <playlist-id> <track-id>...
+```
+
+Two things make it safe to point an agent at:
+
+- **Rate limiting is enforced, not suggested.** Every request goes through a
+  cross-process throttle (2 seconds apart, however many agents are running).
+  Each verb's `--help` states what it costs.
+- **A block stops everything.** If TIDAL answers 429 or flags the session,
+  *all* agent requests fail fast with a structured error until you — a
+  human — run `ticli agent unblock`. Agents can't retry their way into
+  getting your IP banned, because retrying is exactly how that happens.
+
+`resolve` is the verb agents should reach for when they know a song and need
+*the* track: it ranks candidates, refuses to let a wrong artist win however
+good the title match, flags remixes and edits you didn't ask for, and says
+plainly whether it's confident — so the agent (or you) decides, instead of
+discovering a cover version in your playlist later.
+
 ## How it works
 
 Ticli uses [tidalapi](https://github.com/tamland/python-tidal) to authenticate (device or PKCE OAuth) and fetch stream manifests. Audio plays through [mpv](https://mpv.io) — or ffplay, if mpv isn't installed — and on macOS mpv is also what powers the media keys and Now Playing. Hi-res DASH streams arrive as segments and are stitched into a local playlist mpv reads natively. The TUI is [Rich](https://github.com/Textualize/rich), repainting only when something actually changed — an idle player costs roughly zero CPU and zero network.
