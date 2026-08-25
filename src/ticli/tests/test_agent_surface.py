@@ -348,3 +348,59 @@ class TestCliContract:
         assert result.exit_code == 0
         assert json.loads(result.output)["was_tripped"] is True
         assert json.loads(throttle._throttle_path().read_text())["tripped"] is None
+
+
+# ---------------------------------------------------------------------------
+# Docs
+
+
+class TestAgentDocs:
+    def _docs(self):
+        runner = CliRunner()
+        result = runner.invoke(cli, ["agent", "docs"])
+        assert result.exit_code == 0
+        return result.output
+
+    def test_every_verb_that_exists_is_documented(self):
+        """Walks the real click group rather than a hand-kept list, so a verb
+        added without documentation fails here — the docs cannot silently
+        fall behind the surface. Nested groups (playlist) are walked too."""
+        docs = self._docs()
+        agent_group = cli.commands["agent"]
+
+        def walk(group, prefix):
+            for name, command in group.commands.items():
+                full = f"{prefix} {name}"
+                if hasattr(command, "commands"):
+                    walk(command, full)
+                else:
+                    assert full in docs, f"undocumented verb: {full}"
+
+        walk(agent_group, "ticli agent")
+
+    def test_docs_carry_the_load_bearing_rules(self):
+        """Not full prose assertions — the phrases an agent's behaviour
+        hinges on: the trip procedure, the batching rule, what is not yet
+        possible, and the sanctioned-path rule."""
+        docs = self._docs()
+        assert "stop and report to the human" in docs   # the trip procedure
+        assert "batch them, never add in a loop" in docs
+        assert "not in this surface yet" in docs         # playback honesty
+        assert "the only sanctioned path" in docs
+        assert "Human-only" in docs                      # unblock ownership
+
+    def test_docs_is_prose_and_says_so_in_agent_help(self):
+        """docs is the one non-JSON verb; the group help must carry the
+        exception so the JSON contract stays honest."""
+        docs = self._docs()
+        with pytest.raises(json.JSONDecodeError):
+            json.loads(docs)
+        runner = CliRunner()
+        result = runner.invoke(cli, ["agent", "--help"])
+        assert "docs excepted" in result.output
+
+    def test_top_level_help_points_agents_at_docs(self):
+        runner = CliRunner()
+        result = runner.invoke(cli, ["--help"])
+        assert result.exit_code == 0
+        assert "ticli agent docs" in result.output

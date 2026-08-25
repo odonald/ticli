@@ -1593,3 +1593,43 @@ work (`ModuleNotFoundError`; the editable finder points elsewhere — re-run
 requests they make; tidalapi's own token-refresh round trip is not separately
 throttled. Live-player control and an MCP layer were deferred by the owner's
 choice, not overlooked — see DECISIONS.
+
+### (same day) `ticli agent docs`, AGENTS.md, and the --help pointer
+
+**Why.** The owner's test question — "if you're an AI asked to do something
+in Ticli, where would you look?" — had an unflattering honest answer: five
+places, none complete, and a cold agent in `~` finds none of them. His call:
+*"update ticli --help and have it point to ticli agent docs where it has all
+of it."*
+
+**Built:**
+
+- **`agent_docs.py`** — one module, one markdown string, the single source
+  of truth for using ticli programmatically: contract, trip procedure, every
+  verb with cost and JSON example, workflows (resolve-then-batch-add, find
+  playlist by name, entitlement check), and an honest "not in this surface
+  yet" section for playback control so an agent reports the gap instead of
+  scripting around it. `ticli agent docs` prints it — the one deliberately
+  non-JSON verb, because its consumer reads prose; the group help carries
+  the exception ("docs excepted") so the JSON contract stays honest.
+- **`ticli --help`** points AI/script callers at `agent docs`. Click rewraps
+  docstrings, and the first version split "ticli agent docs" across a line
+  break — caught by the test, fixed with click's `\b` no-rewrap marker. The
+  group-mechanics commentary that had leaked into user-facing help moved to
+  a code comment where it belonged.
+- **`AGENTS.md`** at repo root — the emerging convention agents check first.
+  Two branches, two pointers, no content of its own: using ticli →
+  `ticli agent docs`; working on ticli → `ai/README.md`. Deliberately tiny,
+  single-source-of-truth by construction.
+- **Drift-proofing:** the docs test walks the real click group (nested
+  groups included) and asserts every verb that exists appears in the docs —
+  which immediately caught the docs page not documenting `docs` itself. A
+  companion test pins the load-bearing phrases (the trip procedure, the
+  batch-adds rule, the playback honesty, unblock's human-only ownership).
+
+**Rejected:** a `--json` wrapper for docs ({"docs": "..."} is worse for the
+reader and better for nobody); restating the contract in README/AGENTS.md
+(both now point at the verb instead — one meaning, one place).
+
+**Verified:** suite 1,505 → 1,509. Both docs tests failed first for real
+reasons (the rewrap split; the self-documentation gap) before passing.

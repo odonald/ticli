@@ -399,6 +399,13 @@ unconstrained. First-class means the brakes live in code.
 - **Build the core now**: bootstrap + throttle + `status`/`search`/`resolve`/
   `playlist list|show|create|add`/`unblock`. Built same-session, 17 tests,
   mutation-checked. See HISTORY 2026-08-25.
+- **The docs are in the tool** (Garrett, 2026-08-25, same day): *"update
+  ticli --help and have it point to ticli agent docs where it has all of
+  it."* `ticli agent docs` is the single source of truth for using ticli
+  programmatically; `ticli --help` and repo-root `AGENTS.md` point at it,
+  README carries only a trailer. A test walks the click group so an
+  undocumented verb fails the suite — the docs cannot fall behind the
+  surface. Built same day; see HISTORY.
 
 **Deferred by his choice (surfaces he did not pick), recorded so they are
 proposals with context rather than gaps:**

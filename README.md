@@ -118,6 +118,11 @@ speaks JSON on stdout, exactly one object per invocation, with structured
 errors and a nonzero exit when something's wrong. No screen-scraping, no
 importing internals.
 
+The complete contract lives in the tool itself — `ticli agent docs` prints
+every verb with its request cost and JSON shape, the rate rules, and the
+workflows an agent should follow. Point your AI at that; this section is
+just the trailer.
+
 ```bash
 ticli agent status                                  # session, FLAC entitlement, player state — costs 0 requests
 ticli agent search "four tet baby" --type track     # 1 request

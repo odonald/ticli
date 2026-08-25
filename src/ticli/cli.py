@@ -43,12 +43,15 @@ class QualityChoice(click.Choice):
 @click.option("--login-flow", default=None, type=click.Choice(["device", "pkce"], case_sensitive=False), help="How to log in when there is no saved session. device (default) is quickest; pkce needs a paste but is the only flow TIDAL streams FLAC to. Settings can switch later.")
 @click.pass_context
 def cli(ctx, quality, login_flow):
-    """Ticli - Terminal music player for TIDAL.
+    """Ticli - Terminal music player for TIDAL. Plain `ticli` runs the player.
 
-    Plain `ticli` runs the player, exactly as it always has; the group
-    exists only so `ticli agent` can hang off it without the player's
-    import chain slowing `--help` down.
+    \b
+    AI or script? Run `ticli agent docs` — the complete programmatic
+    contract: every verb, JSON shapes, rate rules, and workflows.
     """
+    # A group with invoke_without_command rather than a command, so `ticli
+    # agent` can hang off it; bare `ticli` still means the player, and the
+    # player's import chain still stays out of `--help`.
     if ctx.invoked_subcommand is not None:
         return
     from ticli.player import HeadlessTidalPlayer
@@ -57,13 +60,22 @@ def cli(ctx, quality, login_flow):
 
 @cli.group()
 def agent():
-    """Headless verbs for programs. stdout is always one JSON object.
+    """Headless verbs for programs. Start with `ticli agent docs`.
 
-    Every verb is rate-limited by a cross-process throttle; a TIDAL 429 or
-    bot-detection response stops ALL agent requests until a human runs
-    `ticli agent unblock`. Errors are structured: {"ok": false, "error":
-    <code>, "message": ..., "hint": ...} with a nonzero exit.
+    stdout is always one JSON object (docs excepted). Every verb is
+    rate-limited by a cross-process throttle; a TIDAL 429 or bot-detection
+    response stops ALL agent requests until a human runs `ticli agent
+    unblock`. Errors are structured: {"ok": false, "error": <code>,
+    "message": ..., "hint": ...} with a nonzero exit.
     """
+
+
+@agent.command()
+def docs():
+    """The complete contract, as markdown: every verb with its cost and JSON
+    shape, the rate rules, and workflows. Read this before anything else."""
+    from ticli.agent_docs import DOCS
+    click.echo(DOCS, nl=False)
 
 
 @agent.command()
