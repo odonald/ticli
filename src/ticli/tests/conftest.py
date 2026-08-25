@@ -21,6 +21,7 @@ import pytest
 
 from ticli import player as player_mod
 from ticli.utils import downloads as downloads_mod
+from ticli.utils import throttle as throttle_mod
 
 
 @pytest.fixture(autouse=True)
@@ -33,3 +34,8 @@ def never_the_real_state_dir(tmp_path, monkeypatch):
     state = tmp_path / "state"
     monkeypatch.setattr(player_mod, "STATE_DIR", state)
     monkeypatch.setattr(player_mod, "STATE_FILE", state / "player_state.json")
+    # The agent surface keeps its throttle state in the same directory, via
+    # its own module-level STATE_DIR (player's import chain is too heavy for
+    # `ticli agent --help`). Redirected here with the rest, because a test
+    # that touches the throttle must never read or trip the owner's real one.
+    monkeypatch.setattr(throttle_mod, "STATE_DIR", state)

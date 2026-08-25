@@ -374,6 +374,58 @@ that cannot take an advisory lock (NFS home directory) starts as it always
 did, because being locked out of your own music player by a guard is worse
 than the bug it guards against.
 
+## Agents are first-class callers (Garrett, 2026-08-25 — core **built** 2026-08-25)
+
+His words: *"I would like to make agents interacting with this program a
+first-class feature."* Prompted by watching an agent build him a playlist the
+only way it could — importing internals, writing throwaway scripts, and
+firing ~30 requests in seconds in ignorance of the 15-second rule. The
+motivating principle: **documentation is not enforcement.** The rate rules
+lived in WORKING-RULES.md; an agent that hadn't read them was structurally
+unconstrained. First-class means the brakes live in code.
+
+**Decided by Garrett (2026-08-25), from options put to him directly:**
+
+- **Surface: CLI verbs with JSON output** (`ticli agent <verb>`), chosen over
+  MCP-first and Python-API-first. Any agent with a shell can use it; no
+  framework dependency. stdout is always one JSON object; errors are
+  structured with hints; every verb's `--help` states its request cost.
+- **Throttle behavior: block and wait.** An over-eager caller is slowed, not
+  failed. 2.0s spacing, cross-process (flock'd reservation file in the state
+  dir). On a 429 or 401/subStatus-4006: hard stop for *all* agent requests,
+  structured error, no retry — cleared only by a human running
+  `ticli agent unblock`. Auto-expiry was rejected: a wrong guess costs his
+  music, not a failed request.
+- **Build the core now**: bootstrap + throttle + `status`/`search`/`resolve`/
+  `playlist list|show|create|add`/`unblock`. Built same-session, 17 tests,
+  mutation-checked. See HISTORY 2026-08-25.
+
+**Deferred by his choice (surfaces he did not pick), recorded so they are
+proposals with context rather than gaps:**
+
+- **Live-player control socket** — talk to the running TUI: now-playing,
+  queue add, skip. The single-instance lock already defines "the running
+  ticli"; a control channel would be a second, deliberate way in, not a
+  loosening of that guard. Enables "hey Claude, queue something like this."
+- **MCP server** — a stdio JSON-RPC layer over the same verbs. Hand-rolled
+  (the protocol is small) to keep the no-new-dependencies rule; nicer for
+  Claude specifically, but a second surface to maintain, so it waits until
+  the CLI verbs have proven their shapes.
+
+**Constraints that bound the built core, for whoever extends it:**
+
+- `agent.py` and `throttle.py` must never import `player.py` — `ticli agent
+  --help` is instant (~60ms) and stays that way. Path coupling with the
+  player (state dir, lock filename) is held by tests, not imports.
+- The agent surface never touches the player's queue or state files. A live
+  TUI learns about new playlists the way it learns about any server-side
+  change: by fetching.
+- `resolve` rules are load-bearing, each from a real failure: artist is a
+  gate rather than a score (H.E.R. incident); unrequested qualifiers demote
+  but still resolve, labeled; `feat.` is a credit, not a version;
+  `confident` is strict, and anything less hands the ranked list to the
+  caller instead of choosing quietly.
+
 ## Open questions
 
 - Whether a second ticli should ever be allowed for browsing-only — see the
