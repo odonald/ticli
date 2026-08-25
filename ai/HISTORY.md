@@ -1633,3 +1633,44 @@ reader and better for nobody); restating the contract in README/AGENTS.md
 
 **Verified:** suite 1,505 → 1,509. Both docs tests failed first for real
 reasons (the rewrap split; the self-documentation gap) before passing.
+
+### (same day) The docs audited by a fleet: 8 cold-agent sims + 3 audits, then fixes
+
+**Method.** An 11-agent Opus workflow (owner-requested; supervised per the
+machine-level delegation policy — every prompt a fully-scoped spec, findings
+verified against source before any edit). Eight agents simulated fresh
+arrivals allowed exactly one real command (`agent docs`, 0 requests) and
+paper-planning after; scenarios included the traps: pause the music, delete
+a playlist, a mid-task trip, a non-confident resolve. Three agents ran
+mechanical diffs: docs vs `--help`, docs' JSON examples vs the serializers,
+docs' not-yet list vs README's capability inventory. ~491k Opus tokens,
+2m13s wall. Every load-bearing claim re-verified against agent.py /
+agent_docs.py by the supervising model: zero refutations.
+
+**Headline: 8/8 sims judged the docs sufficient**, and all four traps were
+handled right — empty command plans, report-to-human, no invented verbs, no
+`unblock`. The gaps were edges, and each got a fix in the same commit:
+
+- **`api_error` broke the "each carries a hint" promise** (fail() only adds
+  truthy hints; that call passed none) — now hinted, and **404 became its
+  own `not_found` code** with a where-ids-come-from hint, which also makes
+  agent.py's docstring true (it had listed not_found since the draft;
+  nothing emitted it).
+- **JSON examples drifted from the emitters**: search's `query` echo, add's
+  `playlist_id`, resolve's `artist`/`title` echo, `--verify`'s `verified`
+  field, `flow: null` on no session, and the never-shown album/artist/
+  playlist shapes — all now in the docs.
+- **resolve's `--limit` existed but was undocumented** on the docs page.
+- **Undefined branches the sims walked into**: "add to my X playlist" when
+  no X exists (now: ask before creating, never auto-create); a trip
+  mid-task (now: report done-vs-pending from your own tally, spend nothing
+  reconciling); "is it *actually* FLAC" (now: `--verify` proves the login,
+  not the audio — codec truth lives in the TUI's quality badge).
+- **The not-yet list undersold what's missing**: browsing (album track
+  lists, artist pages) and settings joined playback in the honest list.
+- **The owner, watching the delete scenario run: "it shouldn't actually
+  delete my playlists!!!!"** — locked as a decision (see DECISIONS): no
+  destructive verbs, and the docs now say so in words a cold agent obeys.
+
+Suite 1,509 → 1,512; the new error-classification tests failed under
+mutation (classification collapsed to bare api_error) before restore.

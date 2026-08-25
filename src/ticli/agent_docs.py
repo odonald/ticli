@@ -28,7 +28,8 @@ here to work on ticli's *source*, this is the wrong document — read
   humans; parse stdout only. (`docs` — this page — is the one exception:
   it prints markdown, for you to read rather than parse.)
 - Error codes you must handle: `not_logged_in`, `rate_limited`,
-  `auth_failed`, `api_error`. Each carries a `hint` saying what to do.
+  `auth_failed`, `not_found` (a bad or stale id), `api_error` (anything
+  else). Each carries a `hint` saying what to do.
 - Every verb's `--help` states its request cost. Budget before you loop:
   requests are spaced ~2 seconds apart by a throttle you cannot bypass, so
   20 resolves is ~40 seconds by design. Prefer verbs that answer in one
@@ -45,7 +46,10 @@ pace by hand. But if TIDAL answers 429 or flags the session, the surface
 When you see `rate_limited`: **stop and report to the human.** That is the
 entire procedure. Clearing the trip is `ticli agent unblock`, and it is the
 human's command to run after investigating — a trip cleared on a guess gets
-the IP banned for longer.
+the IP banned for longer. Tripped mid-task: report what completed and what
+was still pending from your own tally of the responses you already have —
+spend nothing trying to reconcile, and leave finishing for after the human
+clears it.
 
 ## Verbs
 
@@ -60,16 +64,22 @@ Where everything stands, for free. Run it first when unsure of the setup.
  "player_running": true,
  "throttle": {"min_interval_seconds": 2.0, "tripped": null}}
 ```
-`flow` is `"pkce"` (entitled to FLAC) or `"device"` (AAC only — TIDAL
-silently downgrades lossless requests from it). `player_running` means the
-human's TUI holds the instance lock right now. `--verify` spends 1 request
-confirming the session actually works.
+`flow` is `"pkce"` (entitled to FLAC), `"device"` (AAC only — TIDAL
+silently downgrades lossless requests from it), or `null` when no session
+is stored (then `flac_capable` is `false` and stays honest). `player_running`
+means the human's TUI holds the instance lock right now. `--verify` spends
+1 request confirming the session actually works and adds `"verified":
+true|false` to the output — it proves the login, not the audio: what codec
+a live stream actually granted is only observable in the TUI's quality
+badge, so answer entitlement questions from `flow`/`flac_capable` and say
+that distinction if the human asks about the bytes.
 
-### `ticli agent resolve --artist A --title T` — 1 request
-**The verb for "the user named a song."** Searches once, ranks locally,
-answers with a best pick and a strict `confident` flag.
+### `ticli agent resolve --artist A --title T [--limit N]` — 1 request
+**The verb for "the user named a song."** Searches once, ranks locally
+(`--limit` candidates, default 10), answers with a best pick and a strict
+`confident` flag.
 ```json
-{"ok": true, "confident": true,
+{"ok": true, "artist": "Folamour", "title": "The Journey", "confident": true,
  "best": {"id": 176427254, "title": "The Journey (feat. Zeke Manyika)",
           "artists": ["Folamour", "Zeke Manyika"], "album": "The Journey",
           "duration_seconds": 262, "explicit": false,
@@ -89,9 +99,11 @@ unrequested qualifier. Anything less is your judgement call, and the ranked
 ### `ticli agent search QUERY [--type track|album|artist|playlist] [--limit N]` — 1 request
 Raw search when resolve's artist+title shape doesn't fit (browsing, albums,
 finding a playlist on TIDAL). `--type` repeats; one request however many
-types. Default: tracks, limit 10. Output: `{"ok": true, "tracks": [...],
-"albums": [...]}` — only the types you asked for, same track shape as
-resolve minus the ranking fields.
+types. Default: tracks, limit 10. Output: `{"ok": true, "query": "...",
+"tracks": [...], "albums": [...]}` — only the types you asked for. Tracks
+are resolve's shape minus the ranking fields; albums are `{id, title,
+artists, num_tracks, year}`; artists `{id, name}`; playlists `{id, name,
+num_tracks, description}`.
 
 ### `ticli agent playlist list` — 1 request
 All of the user's playlists: `{"ok": true, "playlists": [{"id": "...",
@@ -109,8 +121,14 @@ what `add` needs — capture it.
 
 ### `ticli agent playlist add ID TRACK_ID...` — 2 requests
 However many ids, one add — **batch them, never add in a loop.** The server
-skips duplicates; `{"ok": true, "requested": 5, "added": 5}` tells you what
-it actually took.
+skips duplicates; `{"ok": true, "playlist_id": "...", "requested": 5,
+"added": 5}` tells you what it actually took.
+
+There is no `playlist delete`, no track removal, no destructive verb of any
+kind in this surface — deliberately, and it will stay that way. Asked to
+delete a playlist or remove tracks: report that it is human-only, done in
+the TUI (`x` on the track or playlist, with a confirmation). Do not go
+looking for another way.
 
 ### `ticli agent unblock` — 0 requests
 Clears a trip. **Human-only** — see The trip above. Present it to the user
@@ -127,7 +145,8 @@ say so if the list is long.
 
 **"Add this to my X playlist."** `playlist list` → match X locally →
 resolve the song → `add`. Ambiguous name or non-confident resolve: ask,
-with the candidates.
+with the candidates. No playlist matches X at all: ask before creating
+one — never auto-create a playlist the user referred to as existing.
 
 **"What's my setup / can I get FLAC?"** `status`, free. `flac_capable`
 false → the fix is the human running `ticli` and pressing `u` on the
@@ -139,6 +158,11 @@ Say it is not yet supported and point at the TUI; the running player is the
 human's. (A control socket for the live player is specced in the repo's
 `ai/DECISIONS.md` — deferred, not forgotten.) The one thing you *can* see
 is `status`'s `player_running` boolean.
+
+Also not here yet: **browsing** (an album's track list, an artist's page —
+`search` returns albums and artists but nothing opens them) and **settings**
+(quality, cache, artwork — TUI-only). Same procedure: say so, point at the
+TUI.
 
 ## Ground rules
 

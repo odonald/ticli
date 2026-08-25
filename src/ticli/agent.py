@@ -157,13 +157,31 @@ def _persist(session) -> None:
 
 
 def _api_call(fn, *args, **kwargs):
-    """One throttled request: acquire a slot, run it, classify the failure."""
+    """One throttled request: acquire a slot, run it, classify the failure.
+
+    Every failure class carries a hint — the docs promise "each carries a
+    hint saying what to do", and an audit caught api_error breaking that
+    promise. A 404 is its own code: "no such id" and "the API broke" send
+    an agent down different paths, and folding them together made the
+    common mistake (a stale or mistyped id) look like an outage.
+    """
     _acquire()
     try:
         return fn(*args, **kwargs)
     except Exception as e:
         _trip_from(e)
-        raise fail("api_error", f"{type(e).__name__}: {e}")
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        if status == 404:
+            raise fail(
+                "not_found", f"{type(e).__name__}: {e}",
+                hint=("No such id. Playlist ids come from `playlist list` or "
+                      "`playlist create`; track ids from `resolve` or `search`."),
+            )
+        raise fail(
+            "api_error", f"{type(e).__name__}: {e}",
+            hint=("Not a rate limit and not auth — an unclassified API "
+                  "failure. Report it to the human if it persists."),
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -404,3 +404,63 @@ class TestAgentDocs:
         result = runner.invoke(cli, ["--help"])
         assert result.exit_code == 0
         assert "ticli agent docs" in result.output
+
+
+# ---------------------------------------------------------------------------
+# Error classification (from the 2026-08-25 Opus audit: api_error broke the
+# "each carries a hint" promise, and 404s masqueraded as outages)
+
+
+class TestErrorClassification:
+    def _failing_session(self, status_code):
+        class FakeResponse:
+            def __init__(self, code):
+                self.status_code = code
+            def json(self):
+                return {}
+
+        class Boom(Exception):
+            pass
+
+        boom = Boom("kaput")
+        boom.response = FakeResponse(status_code)
+
+        class FakeSession:
+            def playlist(self, pid):
+                raise boom
+
+        return FakeSession()
+
+    def _invoke_show(self, monkeypatch, status_code):
+        monkeypatch.setattr(agent_mod, "_session",
+                            lambda: self._failing_session(status_code))
+        monkeypatch.setattr(throttle, "acquire", lambda **kw: None)
+        runner = CliRunner()
+        result = runner.invoke(cli, ["agent", "playlist", "show", "nope"])
+        assert result.exit_code == 1
+        return json.loads(result.output)
+
+    def test_a_404_is_not_found_not_an_outage(self, monkeypatch, stored_tokens):
+        out = self._invoke_show(monkeypatch, 404)
+        assert out["error"] == "not_found"
+        assert "playlist list" in out["hint"]  # says where real ids come from
+
+    def test_other_failures_are_api_error_with_a_hint(self, monkeypatch, stored_tokens):
+        out = self._invoke_show(monkeypatch, 500)
+        assert out["error"] == "api_error"
+        assert "hint" in out  # the docs promise every code carries one
+
+
+class TestDocsGapFixes:
+    """The phrases added after the fresh-agent simulations — each pins a
+    branch a cold agent hit and the docs left undefined."""
+
+    def test_the_new_rules_are_in_the_docs(self):
+        runner = CliRunner()
+        docs = runner.invoke(cli, ["agent", "docs"]).output
+        assert "never auto-create" in docs           # sim 1: missing playlist
+        assert "no destructive verb" in docs         # sim 5: delete request
+        assert "from your own tally" in docs         # sim 7: trip mid-task
+        assert "it proves the login, not the audio" in docs  # sim 4: --verify
+        assert "not_found" in docs                   # audit: error codes
+        assert "Also not here yet" in docs           # audit: browse/settings
