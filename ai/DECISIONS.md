@@ -399,6 +399,22 @@ unconstrained. First-class means the brakes live in code.
 - **Build the core now**: bootstrap + throttle + `status`/`search`/`resolve`/
   `playlist list|show|create|add`/`unblock`. Built same-session, 17 tests,
   mutation-checked. See HISTORY 2026-08-25.
+- **The docs are in the tool** (Garrett, 2026-08-25, same day): *"update
+  ticli --help and have it point to ticli agent docs where it has all of
+  it."* `ticli agent docs` is the single source of truth for using ticli
+  programmatically; `ticli --help` and repo-root `AGENTS.md` point at it,
+  README carries only a trailer. A test walks the click group so an
+  undocumented verb fails the suite — the docs cannot fall behind the
+  surface. Built same day; see HISTORY.
+
+**No destructive verbs in the agent surface (Garrett, 2026-08-25 — locked).**
+His words, on seeing a simulation scenario that *asked* an agent to delete a
+playlist: *"btw - it shouldn't actually delete my playlists!!!!"* The surface
+has no delete, no track removal, no overwrite — and the docs now say so
+explicitly, so a cold agent reports "human-only, in the TUI" instead of going
+looking. If destructive verbs are ever proposed, they are a new decision for
+him, inheriting the TUI's confirmation DNA — not an extension of this
+surface's write scope.
 
 **Deferred by his choice (surfaces he did not pick), recorded so they are
 proposals with context rather than gaps:**

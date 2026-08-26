@@ -1593,3 +1593,84 @@ work (`ModuleNotFoundError`; the editable finder points elsewhere — re-run
 requests they make; tidalapi's own token-refresh round trip is not separately
 throttled. Live-player control and an MCP layer were deferred by the owner's
 choice, not overlooked — see DECISIONS.
+
+### (same day) `ticli agent docs`, AGENTS.md, and the --help pointer
+
+**Why.** The owner's test question — "if you're an AI asked to do something
+in Ticli, where would you look?" — had an unflattering honest answer: five
+places, none complete, and a cold agent in `~` finds none of them. His call:
+*"update ticli --help and have it point to ticli agent docs where it has all
+of it."*
+
+**Built:**
+
+- **`agent_docs.py`** — one module, one markdown string, the single source
+  of truth for using ticli programmatically: contract, trip procedure, every
+  verb with cost and JSON example, workflows (resolve-then-batch-add, find
+  playlist by name, entitlement check), and an honest "not in this surface
+  yet" section for playback control so an agent reports the gap instead of
+  scripting around it. `ticli agent docs` prints it — the one deliberately
+  non-JSON verb, because its consumer reads prose; the group help carries
+  the exception ("docs excepted") so the JSON contract stays honest.
+- **`ticli --help`** points AI/script callers at `agent docs`. Click rewraps
+  docstrings, and the first version split "ticli agent docs" across a line
+  break — caught by the test, fixed with click's `\b` no-rewrap marker. The
+  group-mechanics commentary that had leaked into user-facing help moved to
+  a code comment where it belonged.
+- **`AGENTS.md`** at repo root — the emerging convention agents check first.
+  Two branches, two pointers, no content of its own: using ticli →
+  `ticli agent docs`; working on ticli → `ai/README.md`. Deliberately tiny,
+  single-source-of-truth by construction.
+- **Drift-proofing:** the docs test walks the real click group (nested
+  groups included) and asserts every verb that exists appears in the docs —
+  which immediately caught the docs page not documenting `docs` itself. A
+  companion test pins the load-bearing phrases (the trip procedure, the
+  batch-adds rule, the playback honesty, unblock's human-only ownership).
+
+**Rejected:** a `--json` wrapper for docs ({"docs": "..."} is worse for the
+reader and better for nobody); restating the contract in README/AGENTS.md
+(both now point at the verb instead — one meaning, one place).
+
+**Verified:** suite 1,505 → 1,509. Both docs tests failed first for real
+reasons (the rewrap split; the self-documentation gap) before passing.
+
+### (same day) The docs audited by a fleet: 8 cold-agent sims + 3 audits, then fixes
+
+**Method.** An 11-agent Opus workflow (owner-requested; supervised per the
+machine-level delegation policy — every prompt a fully-scoped spec, findings
+verified against source before any edit). Eight agents simulated fresh
+arrivals allowed exactly one real command (`agent docs`, 0 requests) and
+paper-planning after; scenarios included the traps: pause the music, delete
+a playlist, a mid-task trip, a non-confident resolve. Three agents ran
+mechanical diffs: docs vs `--help`, docs' JSON examples vs the serializers,
+docs' not-yet list vs README's capability inventory. ~491k Opus tokens,
+2m13s wall. Every load-bearing claim re-verified against agent.py /
+agent_docs.py by the supervising model: zero refutations.
+
+**Headline: 8/8 sims judged the docs sufficient**, and all four traps were
+handled right — empty command plans, report-to-human, no invented verbs, no
+`unblock`. The gaps were edges, and each got a fix in the same commit:
+
+- **`api_error` broke the "each carries a hint" promise** (fail() only adds
+  truthy hints; that call passed none) — now hinted, and **404 became its
+  own `not_found` code** with a where-ids-come-from hint, which also makes
+  agent.py's docstring true (it had listed not_found since the draft;
+  nothing emitted it).
+- **JSON examples drifted from the emitters**: search's `query` echo, add's
+  `playlist_id`, resolve's `artist`/`title` echo, `--verify`'s `verified`
+  field, `flow: null` on no session, and the never-shown album/artist/
+  playlist shapes — all now in the docs.
+- **resolve's `--limit` existed but was undocumented** on the docs page.
+- **Undefined branches the sims walked into**: "add to my X playlist" when
+  no X exists (now: ask before creating, never auto-create); a trip
+  mid-task (now: report done-vs-pending from your own tally, spend nothing
+  reconciling); "is it *actually* FLAC" (now: `--verify` proves the login,
+  not the audio — codec truth lives in the TUI's quality badge).
+- **The not-yet list undersold what's missing**: browsing (album track
+  lists, artist pages) and settings joined playback in the honest list.
+- **The owner, watching the delete scenario run: "it shouldn't actually
+  delete my playlists!!!!"** — locked as a decision (see DECISIONS): no
+  destructive verbs, and the docs now say so in words a cold agent obeys.
+
+Suite 1,509 → 1,512; the new error-classification tests failed under
+mutation (classification collapsed to bare api_error) before restore.

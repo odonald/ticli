@@ -348,3 +348,119 @@ class TestCliContract:
         assert result.exit_code == 0
         assert json.loads(result.output)["was_tripped"] is True
         assert json.loads(throttle._throttle_path().read_text())["tripped"] is None
+
+
+# ---------------------------------------------------------------------------
+# Docs
+
+
+class TestAgentDocs:
+    def _docs(self):
+        runner = CliRunner()
+        result = runner.invoke(cli, ["agent", "docs"])
+        assert result.exit_code == 0
+        return result.output
+
+    def test_every_verb_that_exists_is_documented(self):
+        """Walks the real click group rather than a hand-kept list, so a verb
+        added without documentation fails here — the docs cannot silently
+        fall behind the surface. Nested groups (playlist) are walked too."""
+        docs = self._docs()
+        agent_group = cli.commands["agent"]
+
+        def walk(group, prefix):
+            for name, command in group.commands.items():
+                full = f"{prefix} {name}"
+                if hasattr(command, "commands"):
+                    walk(command, full)
+                else:
+                    assert full in docs, f"undocumented verb: {full}"
+
+        walk(agent_group, "ticli agent")
+
+    def test_docs_carry_the_load_bearing_rules(self):
+        """Not full prose assertions — the phrases an agent's behaviour
+        hinges on: the trip procedure, the batching rule, what is not yet
+        possible, and the sanctioned-path rule."""
+        docs = self._docs()
+        assert "stop and report to the human" in docs   # the trip procedure
+        assert "batch them, never add in a loop" in docs
+        assert "not in this surface yet" in docs         # playback honesty
+        assert "the only sanctioned path" in docs
+        assert "Human-only" in docs                      # unblock ownership
+
+    def test_docs_is_prose_and_says_so_in_agent_help(self):
+        """docs is the one non-JSON verb; the group help must carry the
+        exception so the JSON contract stays honest."""
+        docs = self._docs()
+        with pytest.raises(json.JSONDecodeError):
+            json.loads(docs)
+        runner = CliRunner()
+        result = runner.invoke(cli, ["agent", "--help"])
+        assert "docs excepted" in result.output
+
+    def test_top_level_help_points_agents_at_docs(self):
+        runner = CliRunner()
+        result = runner.invoke(cli, ["--help"])
+        assert result.exit_code == 0
+        assert "ticli agent docs" in result.output
+
+
+# ---------------------------------------------------------------------------
+# Error classification (from the 2026-08-25 Opus audit: api_error broke the
+# "each carries a hint" promise, and 404s masqueraded as outages)
+
+
+class TestErrorClassification:
+    def _failing_session(self, status_code):
+        class FakeResponse:
+            def __init__(self, code):
+                self.status_code = code
+            def json(self):
+                return {}
+
+        class Boom(Exception):
+            pass
+
+        boom = Boom("kaput")
+        boom.response = FakeResponse(status_code)
+
+        class FakeSession:
+            def playlist(self, pid):
+                raise boom
+
+        return FakeSession()
+
+    def _invoke_show(self, monkeypatch, status_code):
+        monkeypatch.setattr(agent_mod, "_session",
+                            lambda: self._failing_session(status_code))
+        monkeypatch.setattr(throttle, "acquire", lambda **kw: None)
+        runner = CliRunner()
+        result = runner.invoke(cli, ["agent", "playlist", "show", "nope"])
+        assert result.exit_code == 1
+        return json.loads(result.output)
+
+    def test_a_404_is_not_found_not_an_outage(self, monkeypatch, stored_tokens):
+        out = self._invoke_show(monkeypatch, 404)
+        assert out["error"] == "not_found"
+        assert "playlist list" in out["hint"]  # says where real ids come from
+
+    def test_other_failures_are_api_error_with_a_hint(self, monkeypatch, stored_tokens):
+        out = self._invoke_show(monkeypatch, 500)
+        assert out["error"] == "api_error"
+        assert "hint" in out  # the docs promise every code carries one
+
+
+class TestDocsGapFixes:
+    """The phrases added after the fresh-agent simulations — each pins a
+    branch a cold agent hit and the docs left undefined."""
+
+    def test_the_new_rules_are_in_the_docs(self):
+        runner = CliRunner()
+        docs = runner.invoke(cli, ["agent", "docs"]).output
+        assert "never auto-create" in docs           # sim 1: missing playlist
+        assert "no destructive verb" in docs         # sim 5: delete request
+        assert "from your own tally" in docs         # sim 7: trip mid-task
+        assert "it proves the login, not the audio" in docs  # sim 4: --verify
+        assert "not_found" in docs                   # audit: error codes
+        assert "Also not here yet" in docs           # audit: browse/settings
