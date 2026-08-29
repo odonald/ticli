@@ -1,6 +1,7 @@
 """Tests for the add-to-playlist picker (y key)."""
 
 import json
+import threading
 import time
 import types
 
@@ -210,10 +211,17 @@ class TestPicker:
         assert len(calls) == 1
 
 
-def _fake_session(created, fail=False, add_fail=False):
-    """A session whose user.create_playlist records what it was asked for."""
+def _fake_session(created, fail=False, add_fail=False, gate=None):
+    """A session whose user.create_playlist records what it was asked for.
+
+    `gate` holds the create open until the test sets it, so a test about
+    what happens *while* a create is in flight does not depend on winning a
+    race against the worker thread.
+    """
     def create_playlist(title, description, parent_id="root"):
         created.append((title, description))
+        if gate is not None:
+            gate.wait(2.0)
         if fail:
             raise RuntimeError("network down")
         return _fake_playlist(title, fail=add_fail, pid="uuid-new")
@@ -347,13 +355,19 @@ class TestCreatePlaylist:
 
     def test_double_enter_creates_one_playlist(self):
         created = []
-        p = self._prompting(created)
+        gate = threading.Event()
+        p = self._prompting(created, gate=gate)
         _type(p, "Road trip")
         p._handle_add_to_playlist_key(KEY_ENTER)
-        # The second Enter, delivered to the picker again as fast as a key
-        # repeat could manage it
+        # The first create is now in flight and held open by the gate, so
+        # the second Enter — delivered as fast as a key repeat could manage
+        # it — is guaranteed to land while the picker is busy. Without the
+        # gate this depended on the worker thread not finishing first, which
+        # it did on a slow CI runner.
+        assert _wait_for(lambda: p._picker_busy)
         p._picker_new_name = "Road trip"
         p._handle_add_to_playlist_key(KEY_ENTER)
+        gate.set()
         assert _wait_for(lambda: not p._picker_busy)
         time.sleep(0.1)
         assert created == [("Road trip", "")]

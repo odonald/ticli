@@ -40,6 +40,17 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update -q && sudo apt-get install -y -q ffmpeg mpv
 
+      - name: Give the backends a null audio device (Linux runners have no sound card)
+        if: runner.os == 'Linux'
+        # The backend tests launch the real mpv/ffplay through the app's own
+        # argument list, which opens the default audio output. Without a
+        # device mpv exits 2 and ffplay stalls. mpv reads ~/.config/mpv/mpv.conf;
+        # ffplay's SDL honours SDL_AUDIODRIVER. macOS runners have CoreAudio.
+        run: |
+          mkdir -p ~/.config/mpv
+          echo "ao=null" > ~/.config/mpv/mpv.conf
+          echo "SDL_AUDIODRIVER=dummy" >> "$GITHUB_ENV"
+
       - name: Install audio backends (macOS)
         if: runner.os == 'macOS'
         run: brew install -q ffmpeg mpv
