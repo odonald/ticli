@@ -28,7 +28,6 @@ No TIDAL session and no real player process.
 
 import threading
 import time
-import types
 
 import pytest
 

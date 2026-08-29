@@ -1,0 +1,4 @@
+# Every change needs the owner's review before it can merge to main.
+# Branch protection has "require review from Code Owners" enabled, so a
+# collaborator's approval alone is not enough.
+*   @odonald

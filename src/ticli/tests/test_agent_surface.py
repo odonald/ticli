@@ -23,7 +23,6 @@ from click.testing import CliRunner
 from ticli import agent as agent_mod
 from ticli.cli import cli
 from ticli.utils import throttle
-from ticli.utils import credential_store
 
 
 # ---------------------------------------------------------------------------

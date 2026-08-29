@@ -1,0 +1,157 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Does the code still work? Full suite on Linux (oldest + newest supported
+  # Python) and macOS (the primary target), with real ffmpeg/mpv so the
+  # backend tests run instead of skipping.
+  # ---------------------------------------------------------------------------
+  tests:
+    name: tests (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, python: "3.10" }
+          - { os: ubuntu-latest, python: "3.14" }
+          - { os: macos-latest,  python: "3.14" }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install audio backends (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -q && sudo apt-get install -y -q ffmpeg mpv
+
+      - name: Install audio backends (macOS)
+        if: runner.os == 'macOS'
+        run: brew install -q ffmpeg mpv
+
+      - name: Install package
+        working-directory: src
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[keyring]" pytest
+
+      - name: Run tests
+        working-directory: src
+        run: python -m pytest ticli/tests/ -q
+
+  # ---------------------------------------------------------------------------
+  # Clean code: correctness-level lint only (syntax errors, undefined names,
+  # unused imports). Deliberately not style/formatting so contributors aren't
+  # blocked on cosmetics — tighten later if wanted.
+  # ---------------------------------------------------------------------------
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff
+      - name: ruff (correctness rules)
+        working-directory: src
+        run: ruff check ticli --isolated --select E9,F --output-format=github
+
+  # ---------------------------------------------------------------------------
+  # Security: static analysis, dependency vulnerabilities, and a tripwire for
+  # the patterns a malicious contribution would need (new network hosts,
+  # eval/exec, encoded blobs, shell=True).
+  # ---------------------------------------------------------------------------
+  security:
+    name: security
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install package + tools
+        working-directory: src
+        run: |
+          pip install -e ".[keyring]"
+          pip install bandit pip-audit
+
+      - name: Tripwire (network hosts, dangerous calls, encoded blobs)
+        run: python .github/scripts/tripwire.py
+
+      - name: bandit (medium+ severity, medium+ confidence)
+        working-directory: src
+        # B108: the mpv IPC socket is deliberately under /tmp because macOS
+        # caps unix socket paths at 104 bytes; the file is pid-named and
+        # unlinked before bind. Tracked, not ignored.
+        run: bandit -q -r ticli -x ticli/tests -ll -ii -s B108
+
+      - name: pip-audit (known CVEs in installed dependencies)
+        run: pip-audit --strict --progress-spinner off
+
+  # ---------------------------------------------------------------------------
+  # Secrets: scan the full history reachable from this ref for tokens/keys.
+  # ---------------------------------------------------------------------------
+  secrets:
+    name: secrets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ---------------------------------------------------------------------------
+  # Dependency review: fail a PR that adds a dependency with a known
+  # vulnerability or a disallowed license.
+  # ---------------------------------------------------------------------------
+  dependency-review:
+    name: dependency-review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: moderate
+
+  # ---------------------------------------------------------------------------
+  # Single gate for branch protection: require "CI passed" instead of listing
+  # every matrix leg by name.
+  # ---------------------------------------------------------------------------
+  ci-ok:
+    name: CI passed
+    if: always()
+    needs: [tests, lint, security, secrets, dependency-review]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check upstream job results
+        run: |
+          echo '${{ toJSON(needs) }}'
+          # dependency-review is skipped on push events; skipped is fine there.
+          for r in "${{ needs.tests.result }}" "${{ needs.lint.result }}" \
+                   "${{ needs.security.result }}" "${{ needs.secrets.result }}"; do
+            [ "$r" = "success" ] || { echo "a required job did not succeed"; exit 1; }
+          done
+          case "${{ needs.dependency-review.result }}" in
+            success|skipped) ;;
+            *) echo "dependency-review failed"; exit 1 ;;
+          esac
