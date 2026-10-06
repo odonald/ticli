@@ -7,6 +7,7 @@ No TIDAL session or network needed.
 
 import json
 import os
+import types
 
 import pytest
 from click.testing import CliRunner
@@ -433,6 +434,50 @@ class TestSaveLoadRoundTrip:
         save_config(dict(DEFAULTS))  # must not raise
 
 
+class TestUpdateConfig:
+    def test_two_writers_neither_tear_the_file_nor_lose_a_change(self, config_file):
+        import threading
+
+        torn = []
+
+        def write(key, values):
+            for value in values:
+                config_mod.update_config({key: value})
+                if load_config().get(config_mod.UNREADABLE):
+                    torn.append(key)
+
+        writers = [threading.Thread(target=write, args=("page_size", [*range(5, 40)] * 2 + [33])),
+                   threading.Thread(target=write, args=("progress_bar_max", [*range(20, 90)] + [78]))]
+        for writer in writers:
+            writer.start()
+        for writer in writers:
+            writer.join()
+        assert torn == []
+        cfg = load_config()
+        assert (cfg["page_size"], cfg["progress_bar_max"]) == (33, 78)
+        assert [f.name for f in config_file.parent.iterdir() if f.name.endswith(".tmp")] == []
+
+    def test_only_the_changed_key_is_written(self, config_file):
+        save_config({**DEFAULTS, "allow_ai_control": False, "page_size": 20})
+        config_mod.update_config({"quality": "MAX"})
+        cfg = load_config()
+        assert (cfg["allow_ai_control"], cfg["page_size"], cfg["quality"]) == (False, 20, "MAX")
+
+    def test_an_unreadable_file_is_never_replaced(self, config_file):
+        config_file.write_text("{torn")
+        with pytest.raises(config_mod.ConfigUnreadable):
+            config_mod.update_config({"page_size": 20})
+        assert config_file.read_text() == "{torn"
+
+    def test_an_unreadable_file_loads_with_the_switches_closed(self, config_file):
+        config_file.write_text('{"allow_ai_control": true, "ai_control')
+        cfg = load_config()
+        assert cfg[config_mod.UNREADABLE] is True
+        assert cfg["allow_ai_control"] is False and cfg["allow_dangerous_commands"] is False
+        save_config(cfg)
+        assert config_mod.UNREADABLE not in json.loads(config_file.read_text())
+
+
 class TestCoerce:
     def test_int_clamped_to_bounds(self):
         spec = get_spec("page_size")
@@ -556,7 +601,17 @@ class TestSettingsKeyHandler:
         p._settings_cursor = 0
         p._handle_settings_key(player_mod.KEY_LEFT)  # HIGH → MEDIUM
         assert p._quality_name == "MEDIUM"
-        assert p.session.audio_quality == tidalapi.Quality.low_320k
+        asked = []
+
+        def _stream():
+            asked.append(p.session.audio_quality)
+            return types.SimpleNamespace(
+                audio_quality=asked[-1],
+                get_stream_manifest=lambda: types.SimpleNamespace(
+                    is_bts=True, get_urls=lambda: ["http://127.0.0.1/1.mp4"]))
+
+        p._stream_url(types.SimpleNamespace(id=1, get_stream=_stream))
+        assert asked == [tidalapi.Quality.low_320k], "the next stream ignored the new quality"
 
     def test_page_size_change_applies_live_and_saves(self, config_file):
         p = self._player()
@@ -914,14 +969,14 @@ class TestVolumeCeilingIsDurable:
         assert p.audio.volumes == [250]
 
     def test_run_clamps_before_anything_plays(self, config_file, monkeypatch):
-        """The whole point of doing it in run(): the backend is only known
+        """The whole point of doing it in start(): the backend is only known
         there, and nothing must have been played at the stale volume yet."""
         save_config({**DEFAULTS, "volume": 250})
         monkeypatch.setattr(player_mod, "_find_audio_player", lambda: "ffplay")
         p = HeadlessTidalPlayer()
-        monkeypatch.setattr(p, "_login", lambda: False)  # stop run() right after
+        monkeypatch.setattr(p, "_login", lambda interactive=True: False)  # stop start() right after
 
-        p.run()
+        p.start()
 
         assert p.config["volume"] == 100
         assert p.audio.volume == 100, "never handed the out-of-range value"
@@ -1002,15 +1057,12 @@ class TestCLIQuality:
     def _patch_player(self, monkeypatch):
         seen = {}
 
-        class _FakePlayer:
-            def __init__(self, quality=None, login_flow=None):
-                seen["quality"] = quality
-                seen["login_flow"] = login_flow
+        def _fake_tui(quality=None, login_flow=None):
+            seen["quality"] = quality
+            seen["login_flow"] = login_flow
+            seen["ran"] = True
 
-            def run(self):
-                seen["ran"] = True
-
-        monkeypatch.setattr(player_mod, "HeadlessTidalPlayer", _FakePlayer)
+        monkeypatch.setattr(player_mod, "run_tui", _fake_tui)
         return seen
 
     def test_explicit_quality_is_passed_through(self, monkeypatch):

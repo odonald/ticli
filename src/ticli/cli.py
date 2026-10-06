@@ -40,7 +40,7 @@ class QualityChoice(click.Choice):
 
 @click.group(invoke_without_command=True)
 @click.option("--quality", default=None, type=QualityChoice(QUALITY_NAMES, case_sensitive=False), help="Audio quality for this run (overrides the saved setting)")
-@click.option("--login-flow", default=None, type=click.Choice(["device", "pkce"], case_sensitive=False), help="How to log in when there is no saved session. device (default) is quickest; pkce needs a paste but is the only flow TIDAL streams FLAC to. Settings can switch later.")
+@click.option("--login-flow", default=None, type=click.Choice(["device", "pkce"], case_sensitive=False), help="How to log in. device (default) is quickest; pkce needs a paste but is the only flow TIDAL streams FLAC to. With pkce, a player signed in by the device flow offers the upgrade. Settings can switch later.")
 @click.pass_context
 def cli(ctx, quality, login_flow):
     """Ticli - Terminal music player for TIDAL. Plain `ticli` runs the player.
@@ -54,20 +54,24 @@ def cli(ctx, quality, login_flow):
     # player's import chain still stays out of `--help`.
     if ctx.invoked_subcommand is not None:
         return
-    from ticli.player import HeadlessTidalPlayer
-    HeadlessTidalPlayer(quality=quality, login_flow=login_flow).run()
+    from ticli.player import run_tui
+    run_tui(quality=quality, login_flow=login_flow)
 
 
 @cli.group()
-def agent():
+@click.option("--key", envvar="TICLI_AI_KEY", default=None, help="The AI control key, if your human set one (or TICLI_AI_KEY).")
+@click.pass_context
+def agent(ctx, key):
     """Headless verbs for programs. Start with `ticli agent docs`.
 
     stdout is always one JSON object (docs excepted). Every verb is
     rate-limited by a cross-process throttle; a TIDAL 429 or bot-detection
     response stops ALL agent requests until a human runs `ticli agent
     unblock`. Errors are structured: {"ok": false, "error": <code>,
-    "message": ..., "hint": ...} with a nonzero exit.
+    "message": ..., "hint": ...} with a nonzero exit. The human's TUI
+    settings decide what agents may do; a refusal says what to ask them.
     """
+    ctx.obj = {"key": key}
 
 
 @agent.command()
@@ -148,7 +152,7 @@ def playlist_add(playlist_id, track_ids):
 @agent.command()
 def unblock():
     """Clear a tripped rate-limit stop. For humans, after investigating —
-    an agent must never run this."""
+    works only from a terminal; an agent must never run this."""
     from ticli import agent as impl
     impl.unblock()
 

@@ -1,18 +1,19 @@
 """The agent surface: JSON contract, throttle enforcement, resolve ranking.
 
 Two of these are regression tests for failures that actually happened on
-2026-08-25, the session that motivated the feature (see HISTORY):
+2026-08-25, the session that motivated the feature:
 
 - an agent fired ~30 requests in seconds because the rate rules lived in
   Markdown (TestThrottle asserts the brake is now in the request path);
 - a resolver whose remix penalty outweighed its artist bonus served
   "The Journey" by H.E.R. for Folamour's (TestResolve replays it).
 
-Everything runs against fakes — zero live requests, per WORKING-RULES. The
+Everything runs against fakes — zero live requests (docs/adr/0001-tidal-rate-limits.md).
+The
 throttle tests inject `now`/`sleep` and then assert the *file on disk*,
 because the reservation arithmetic and the trip record are the observable
-reality here; a test that only checked return values would be the shape of
-INCIDENTS #2.
+reality here; a test that only checked return values could stay green over
+a brake that never engaged.
 """
 
 import json
@@ -277,6 +278,8 @@ class TestCliContract:
         out = json.loads(result.output)
         assert out == {
             "ok": True,
+            "ai_control": {"allow_ai_control": True, "allow_dangerous_commands": False,
+                           "key_required": False},
             "session_stored": True,
             "flow": "pkce",
             "flac_capable": True,
@@ -340,7 +343,17 @@ class TestCliContract:
         assert out == {"ok": True, "playlist_id": "pl-1", "requested": 2, "added": 2}
         assert added == ["11", "22"]  # ids reach the API as strings
 
-    def test_unblock_via_cli_clears_a_real_trip(self, stored_tokens):
+    def test_unblock_without_a_terminal_is_refused_and_keeps_the_trip(self, stored_tokens):
+        throttle.trip("http_429")
+        result = CliRunner().invoke(cli, ["agent", "unblock"])  # CliRunner's stdin is no TTY
+        payload = json.loads(result.output)
+        assert result.exit_code == 1 and payload["error"] == "human_only"
+        assert "ask your human to run `ticli agent unblock` in a terminal" in payload["hint"]
+        assert json.loads(throttle._throttle_path().read_text())["tripped"] is not None
+
+    def test_unblock_via_cli_clears_a_real_trip(self, monkeypatch, stored_tokens):
+        from ticli import commands
+        monkeypatch.setattr(commands, "cli_caller", lambda stdin=None: commands.HUMAN)
         throttle.trip("http_429")
         runner = CliRunner()
         result = runner.invoke(cli, ["agent", "unblock"])
@@ -463,3 +476,84 @@ class TestDocsGapFixes:
         assert "it proves the login, not the audio" in docs  # sim 4: --verify
         assert "not_found" in docs                   # audit: error codes
         assert "Also not here yet" in docs           # audit: browse/settings
+
+
+class TestPermissions:
+    """`ticli agent` obeys the human's switches before it spends a request."""
+
+    @pytest.fixture
+    def no_session(self, monkeypatch):
+        opened = []
+        monkeypatch.setattr(agent_mod, "_session", lambda: opened.append(1) or None)
+        return opened
+
+    def _settings(self, **values):
+        from ticli.utils import config as config_mod
+        config_mod.save_config({**config_mod.DEFAULTS, **values})
+
+    def test_ai_control_off_refuses_tidal_verbs(self, stored_tokens, no_session):
+        self._settings(allow_ai_control=False)
+        result = CliRunner().invoke(cli, ["agent", "search", "x"])
+        payload = json.loads(result.output)
+        assert result.exit_code == 1 and payload["error"] == "ai_control_off"
+        assert "never edit config.json" in payload["hint"]
+        assert no_session == []
+
+    def test_ai_control_off_answers_playlist_list_from_disk(self, stored_tokens, no_session):
+        self._settings(allow_ai_control=False)
+        result = CliRunner().invoke(cli, ["agent", "playlist", "list"])
+        payload = json.loads(result.output)
+        assert payload["ok"] and payload["source"] == "disk"
+        assert no_session == []
+
+    def test_a_failing_disk_read_is_one_json_error(self, stored_tokens, no_session, monkeypatch):
+        from ticli.utils.cache import MetadataCache
+
+        def boom(self):
+            raise RuntimeError("corrupt")
+        monkeypatch.setattr(MetadataCache, "get_playlists", boom)
+        self._settings(allow_ai_control=False)
+        result = CliRunner().invoke(cli, ["agent", "playlist", "list"])
+        payload = json.loads(result.output)
+        assert result.exit_code == 1 and payload["ok"] is False
+        assert payload["error"] == "local_read_failed" and payload["hint"]
+
+    def test_a_set_key_is_required(self, stored_tokens, no_session):
+        from ticli.utils.config import hash_ai_key
+        self._settings(ai_control_key=hash_ai_key("open sesame"))
+        missing = json.loads(CliRunner().invoke(cli, ["agent", "playlist", "list"]).output)
+        assert missing["error"] == "key_required"
+        assert no_session == []
+
+    def test_the_key_comes_from_the_environment_or_the_flag(self, monkeypatch, stored_tokens):
+        from ticli.utils.config import hash_ai_key
+        self._settings(ai_control_key=hash_ai_key("open sesame"))
+
+        class FakeUser:
+            def playlists(self):
+                return []
+
+        class FakeSession:
+            user = FakeUser()
+
+        monkeypatch.setattr(agent_mod, "_session", lambda: FakeSession())
+        monkeypatch.setattr(agent_mod, "_acquire", lambda: None)
+        by_env = CliRunner().invoke(cli, ["agent", "playlist", "list"],
+                                    env={"TICLI_AI_KEY": "open sesame"})
+        by_flag = CliRunner().invoke(cli, ["agent", "--key", "open sesame", "playlist", "list"])
+        assert json.loads(by_env.output)["ok"] and json.loads(by_flag.output)["ok"]
+
+    def test_status_is_never_gated_and_reports_the_switches(self, stored_tokens):
+        from ticli.utils.config import hash_ai_key
+        self._settings(allow_ai_control=False, ai_control_key=hash_ai_key("k"))
+        payload = json.loads(CliRunner().invoke(cli, ["agent", "status"]).output)
+        assert payload["ok"]
+        assert payload["ai_control"] == {"allow_ai_control": False,
+                                         "allow_dangerous_commands": False,
+                                         "key_required": True}
+
+    def test_docs_state_the_honour_system(self):
+        from ticli.agent_docs import DOCS
+        for phrase in ("Only the\nhuman can change them", "never edit `config.json`",
+                       "TICLI_AI_KEY", "ask\nyour human", "dangerous_off", "key_required"):
+            assert phrase in DOCS, phrase

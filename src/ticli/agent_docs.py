@@ -18,7 +18,7 @@ ticli is a terminal music player for TIDAL; the TUI is the human's surface.
 `ticli agent` is yours: headless verbs that speak JSON, rate-limited in code.
 Everything you can do with ticli programmatically is on this page. If you are
 here to work on ticli's *source*, this is the wrong document — read
-`ai/README.md` in the repo first.
+`CLAUDE.md` in the repo first.
 
 ## The contract
 
@@ -29,7 +29,9 @@ here to work on ticli's *source*, this is the wrong document — read
   it prints markdown, for you to read rather than parse.)
 - Error codes you must handle: `not_logged_in`, `rate_limited`,
   `auth_failed`, `not_found` (a bad or stale id), `api_error` (anything
-  else). Each carries a `hint` saying what to do.
+  else), and the permission refusals below (`ai_control_off`,
+  `dangerous_off`, `key_required`, `wrong_key`). Each carries a `hint`
+  saying what to do.
 - Every verb's `--help` states its request cost. Budget before you loop:
   requests are spaced ~2 seconds apart by a throttle you cannot bypass, so
   20 resolves is ~40 seconds by design. Prefer verbs that answer in one
@@ -51,6 +53,27 @@ was still pending from your own tally of the responses you already have —
 spend nothing trying to reconcile, and leave finishing for after the human
 clears it.
 
+## Permissions — your human decides, you ask
+
+Three switches in ticli's TUI settings decide what you may do. **Only the
+human can change them**, by keypress in the TUI. No command or verb can
+change them, and you must never edit `config.json`, write ticli's files or
+pretend to be the TUI to get around them. Any change shows up in the TUI.
+
+- **Allow AI control** (on by default). Off: every verb that reaches TIDAL
+  is refused with `ai_control_off`; `status` still answers, and
+  `playlist list` answers from what is saved on disk (`"source": "disk"`).
+- **Allow dangerous commands** (off by default). Dangerous: deleting or
+  renaming a playlist, removing tracks from one, deleting downloads,
+  clearing the cache, lowering the cache budget, logging out, changing the
+  login flow. Refused with `dangerous_off`.
+- **AI control key** (unset by default). Set: every verb except `status`
+  needs it, via `TICLI_AI_KEY` or `ticli agent --key KEY <verb>`. Missing →
+  `key_required`; wrong → `wrong_key`, after a 1 s delay. Do not guess.
+
+`status` reports all three as `ai_control`. On any refusal: stop and ask
+your human, quoting the refusal's `hint`. That is the whole procedure.
+
 ## Verbs
 
 ### `ticli agent docs` — 0 requests
@@ -60,7 +83,9 @@ consumer is you, reading — not a program, parsing.
 ### `ticli agent status` — 0 requests
 Where everything stands, for free. Run it first when unsure of the setup.
 ```json
-{"ok": true, "session_stored": true, "flow": "pkce", "flac_capable": true,
+{"ok": true, "ai_control": {"allow_ai_control": true,
+ "allow_dangerous_commands": false, "key_required": false},
+ "session_stored": true, "flow": "pkce", "flac_capable": true,
  "player_running": true,
  "throttle": {"min_interval_seconds": 2.0, "tripped": null}}
 ```
@@ -125,14 +150,15 @@ skips duplicates; `{"ok": true, "playlist_id": "...", "requested": 5,
 "added": 5}` tells you what it actually took.
 
 There is no `playlist delete`, no track removal, no destructive verb of any
-kind in this surface — deliberately, and it will stay that way. Asked to
-delete a playlist or remove tracks: report that it is human-only, done in
-the TUI (`x` on the track or playlist, with a confirmation). Do not go
-looking for another way.
+kind in this surface yet; when they come they will need the human's "Allow
+dangerous commands". Asked to delete a playlist or remove tracks: report
+that it is done in the TUI (`x` on the track, with a confirmation). Do not
+go looking for another way.
 
 ### `ticli agent unblock` — 0 requests
 Clears a trip. **Human-only** — see The trip above. Present it to the user
-as the command *they* run; do not run it for them.
+as the command *they* run; do not run it for them. Without a terminal on
+stdin it refuses with `human_only`.
 
 ## Workflows
 
@@ -155,8 +181,8 @@ settings page (PKCE sign-in).
 **Anything that touches playback** — play, pause, skip, queue, volume,
 what's playing, downloads, favorites, radio: **not in this surface yet.**
 Say it is not yet supported and point at the TUI; the running player is the
-human's. (A control socket for the live player is specced in the repo's
-`ai/DECISIONS.md` — deferred, not forgotten.) The one thing you *can* see
+human's. (Control of the live player is planned, not built yet.) The one
+thing you *can* see
 is `status`'s `player_running` boolean.
 
 Also not here yet: **browsing** (an album's track list, an artist's page —
