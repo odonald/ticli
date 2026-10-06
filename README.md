@@ -131,7 +131,12 @@ ticli agent playlist create "Morning Uplift"
 ticli agent playlist add <playlist-id> <track-id>...
 ```
 
-Two things make it safe to point an agent at:
+Three things make it safe to point an agent at:
+
+- **You hold the switches.** The settings page (`c`) has "Allow AI control"
+  (on), "Allow dangerous commands" (off) and an optional "AI control key"
+  that agents must pass as `TICLI_AI_KEY`. Only a keypress in the TUI
+  changes them, and every refusal tells the agent to ask you.
 
 - **Rate limiting is enforced, not suggested.** Every request goes through a
   cross-process throttle (2 seconds apart, however many agents are running).
@@ -158,27 +163,16 @@ Ticli uses [tidalapi](https://github.com/tamland/python-tidal) to authenticate (
 └─────────┘    metadata     └───────────┘                  └───────────┘
 ```
 
-## Contributing, and a note for AI agents
+## Contributing
 
-**Start with [`ai/README.md`](ai/README.md).** Much of this project was built
-with AI assistance, and `ai/` is where the reasoning lives: the constraints that
-are load-bearing, what was measured, what was tried and rejected, and the
-incidents that produced the rules. It is short, and reading it first will save
-you from re-deriving things the hard way — several of its rules exist because
-violating them broke something real.
+The code is the documentation. [`CLAUDE.md`](CLAUDE.md) maps the codebase and
+lists the few rules that prevent real damage, [`GLOSSARY.md`](GLOSSARY.md)
+defines the project's terms, and [`docs/adr/`](docs/adr/) records the
+decisions the code can't explain on its own.
 
-Two constraints are worth knowing before you touch anything:
-
-- **Be frugal with TIDAL's API.** Rate-limiting an account is easy to do by
-  accident and it stops the owner's music. `ai/WORKING-RULES.md` has the
-  specifics.
-- **Tests assert observable reality** — bytes on disk, escape sequences on the
-  terminal, request counts — not internal bookkeeping. A feature here once
-  passed its whole suite for two days without writing a single byte.
-
-If you are an AI agent working on this repository, **updating `ai/` is part of
-the work, in the same commit as the code.** `ai/README.md` says what belongs
-where.
+One constraint is worth knowing before you touch anything: **be frugal with
+TIDAL's API.** Rate-limiting an account is easy to do by accident and it stops
+the owner's music ([ADR-0001](docs/adr/0001-tidal-rate-limits.md)).
 
 ## Requirements
 
