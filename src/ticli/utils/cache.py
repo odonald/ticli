@@ -1,107 +1,77 @@
-"""On-disk cache for Ticli.
+"""On-disk cache for Ticli: a metadata index (playlists and their tracks, so
+"Your Playlists" paints before TIDAL answers) and an audio directory (whole
+tracks, written by AudioPlayer, sized and evicted here).
 
-Two things live here, because they share one budget and one directory:
+Machine-owned and disposable, unlike `~/.config/ticli`, except that the same
+directory also holds the download index (`downloads.json`, utils/downloads.py):
+losing it forgets the user's whole download library.
 
-* a **metadata index** — the playlists you own and the tracks in them, as
-  plain records. It exists so opening "Your Playlists" paints instantly
-  instead of waiting on a TIDAL round trip.
-* an **audio directory** — whole tracks, only when the cache setting asks
-  for them. Playback writes it (see AudioPlayer), this module only sizes
-  and evicts it.
-
-Deliberately not in `~/.config/ticli`: config is user-owned and precious,
-this is machine-owned and disposable. Deleting the whole cache directory at
-any moment is always safe — the app just gets slow again for one visit.
-The location follows each OS's own convention (XDG on Linux, ~/Library/Caches
-on macOS, %LOCALAPPDATA% on Windows) rather than one hardcoded path.
-
-Freshness policy: the cache is a *first paint*, never an answer. Every read
-is paired with a live fetch by the caller, and the live result replaces what
-was shown as soon as it lands — so a playlist edited on your phone is wrong
-on screen for exactly as long as one network request takes, which is the
-same time you'd otherwise have spent staring at "Loading...". MAX_AGE only
-bounds the pathological case (offline for a month), where showing a year-old
-list would be worse than showing nothing.
-
-The index is deliberately record-shaped, not object-shaped: every track
-carries its name, artists and album as text, so a later "search my
-playlists" can scan the whole index locally without touching the network.
+The cache is a first paint, never an answer while online: callers pair every
+read with a live fetch that replaces it. Offline it is the answer, with its age
+(ADR-0009): nothing expires, and the index (one file per list, `lists/`) is held
+to METADATA_CAP_BYTES, evicting the least recently opened lists first and the
+user's own library last.
+Records are flat text so a local search can scan the index.
 """
 
+import contextlib
+import hashlib
 import json
 import logging
 import os
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 CACHE_VERSION = 1
+MANIFEST_VERSION = 2
+# `_load_tracker` reads a file with a different version as empty, so bumping
+# this forgets every play count. Translate old values at read time instead.
 TRACKER_VERSION = 1
 
-# What a play is worth waiting for before it counts. A skip is not a play, and
-# the whole eviction rule is "points per play", so the threshold is what keeps
-# a four-hour shuffle through a hundred previews from out-scoring a staple.
-# Thirty seconds, or half of a track shorter than a minute.
+# Seconds of a track that must play before it counts (half of a track under a
+# minute). Keeps a shuffle through previews from out-scoring a staple.
 PLAY_COUNTS_AFTER = 30.0
 
-# The budget is a whole number of gigabytes on the settings page and bytes
-# everywhere below it. Read at call time, so a test can shrink a gigabyte.
 BYTES_PER_GB = 1024 ** 3
 
-# Beyond this an entry is treated as absent. Only reachable by being offline
-# (or not opening a playlist) for a month — every visit rewrites the entry.
-MAX_AGE_SECONDS = 30 * 24 * 3600
+# Metadata has its own cap, separate from the audio budget (ADR-0009).
+METADATA_CAP_BYTES = 100 * 1024 * 1024
+# Eviction goes this far under the cap so it is not paid again on the next write.
+EVICT_TO = 0.9
+ORPHAN_GRACE_SECONDS = 60
+# Evicted last: the lists that are the user's own library.
+LIBRARY_PREFIXES = ("favorites:",)
+LIBRARY_KEYS = ("playlists", "mixes")
 
-# Index keys. Flat strings so the file stays greppable by hand.
-KEY_PLAYLISTS = "playlists"
-
-# What ticli itself writes into the audio directory: "{track_id}{ext}" once a
-# track is whole, and "{track_id}.part" while it is still arriving. Every
-# extension AudioPlayer can produce is here (player._audio_extension owns that
-# list; test_cache pins the two together). The rule matters because deleting
-# cached songs deletes an explicit list of files ticli owns — the cache
-# directory is a shared place, and anything else in it is somebody else's.
+# Every extension AudioPlayer can produce (player._audio_extension owns that
+# list; test_cache pins the two together).
 AUDIO_EXTENSIONS = (".m4a", ".mp3", ".aac", ".flac", ".ogg", ".wav")
 
 
 def is_owned_audio(name: str) -> bool:
-    """Whether a filename is one ticli wrote.
-
-    A part file is bare — `467461385.part`, no extension — because
-    `AudioPlayer._start_download` opens the handle before the CDN has said
-    what container it is sending; the extension only arrives with the first
-    response header, and the file is renamed to `{track_id}{ext}` at the end.
-    So the extension is *optional* on a `.part` and required on a whole file.
-
-    This asked for `{track_id}{ext}.part` for a year and got False for every
-    part file production ever wrote. A leaked one — SIGKILL, a crash, power
-    loss, anything that isn't `stop()` — was then counted against the budget
-    by `total_bytes` (a plain directory size, which does not consult this)
-    while being invisible to `owned_audio_files`, so it could be neither
-    evicted nor cleared. Once the leak exceeded the budget every sweep
-    deleted every real song and kept the leak. See ai/INCIDENTS #6.
-    """
+    """Whether a filename is one ticli wrote: `{track_id}{ext}`, or
+    `{track_id}.part` (extension optional there, because the downloader opens
+    the file before the CDN names the container). Leaked parts must match, or
+    they count against the budget but can never be evicted."""
     if name.endswith(".part"):
         stem = name[:-len(".part")]
         root, ext = os.path.splitext(stem)
-        # Bare "{track_id}.part" is what the downloader opens; the extended
-        # form is kept because a rename that lands mid-sweep is still ours
         if not ext:
-            return bool(stem) and stem.isdigit()
+            return stem.isdigit()
     else:
         root, ext = os.path.splitext(name)
-    return bool(root) and root.isdigit() and ext.lower() in AUDIO_EXTENSIONS
+    return root.isdigit() and ext.lower() in AUDIO_EXTENSIONS
 
 
 def owned_audio_files() -> list:
     """Every cached track (and half-written track) ticli owns, by exact path.
-
-    Built by name, never by wiping the directory: a file in there that ticli
-    did not create must survive anything this module does.
-    """
+    Never a directory wipe: files ticli did not create must survive."""
     files = []
     try:
         entries = list(audio_dir().iterdir())
@@ -109,7 +79,6 @@ def owned_audio_files() -> list:
         return files
     for path in entries:
         try:
-            # A path that has become a directory is not a track ticli wrote
             if is_owned_audio(path.name) and path.is_file():
                 files.append(path)
         except OSError:
@@ -118,13 +87,8 @@ def owned_audio_files() -> list:
 
 
 def cached_audio_path(track_id):
-    """The whole cached file for this track, or None.
-
-    Looked up by stem, because the extension is whatever the stream turned
-    out to be, and a half-written `.part` is never an answer. The disk, not
-    the tracker, because existence is the disk's to say — a song deleted by
-    hand has to fall through to the network rather than be claimed.
-    """
+    """The whole cached file for this track, or None. Asks the disk, not the
+    tracker: a song deleted by hand must fall through to the network."""
     if track_id in (None, ""):
         return None
     try:
@@ -138,7 +102,6 @@ def cached_audio_path(track_id):
 
 
 def _default_cache_dir() -> Path:
-    """The OS's own cache location, not a hardcoded one."""
     if sys.platform == "win32":
         base = os.environ.get("LOCALAPPDATA")
         root = Path(base) if base else Path.home() / "AppData" / "Local"
@@ -154,8 +117,21 @@ CACHE_DIR = _default_cache_dir()
 
 
 def index_file() -> Path:
-    """Read CACHE_DIR at call time so tests can redirect the whole cache."""
+    """The single-file index of older versions, split into lists_dir() on first load."""
     return CACHE_DIR / "metadata.json"
+
+
+def lists_dir() -> Path:
+    """Read CACHE_DIR at call time so tests can redirect the whole cache."""
+    return CACHE_DIR / "lists"
+
+
+def manifest_file() -> Path:
+    return lists_dir() / "manifest.json"
+
+
+def list_file(key: str) -> Path:
+    return lists_dir() / (hashlib.sha256(key.encode()).hexdigest()[:32] + ".json")
 
 
 def audio_dir() -> Path:
@@ -163,35 +139,21 @@ def audio_dir() -> Path:
 
 
 def tracker_file() -> Path:
-    """The cache tracker: what ticli meant to have cached, and why.
-
-    Its own file rather than a section of `metadata.json`, because the two
-    are gated by different settings — this is bookkeeping about *audio*, so it
-    lives and dies with `cache_songs`, and turning the metadata index off must
-    not blind eviction. Outside `audio_dir()` too, so it never counts against
-    a budget that is about songs.
-    """
+    """Audio bookkeeping. Separate from `metadata.json` because the two are
+    gated by different settings (turning metadata off must not blind
+    eviction), and outside `audio_dir()` so it is not counted in the budget."""
     return CACHE_DIR / "audio.json"
 
 
 def artwork_dir() -> Path:
-    """Rendered cover art (see utils/artwork.py).
-
-    Its own directory, deliberately outside audio_dir: the budget, the song
-    count and the eviction order are all about audio, and a few hundred files
-    of a few hundred bytes each must not move any of those numbers. Artwork
-    keeps its own small ceiling instead.
-    """
+    """Rendered cover art (utils/artwork.py), outside audio_dir so it does not
+    move the budget, song count or eviction order. It has its own ceiling."""
     return CACHE_DIR / "artwork"
 
 
 def clear_artwork() -> int:
-    """Delete every rendered cover. Returns how many went.
-
-    By name, like every other deletion here: only files ticli wrote (the
-    `.art` renderings and any `.tmp` left by an interrupted write) are
-    touched, never the directory.
-    """
+    """Delete every rendered cover (`.art`, and `.tmp` leftovers). Returns how
+    many went."""
     removed = 0
     try:
         entries = list(artwork_dir().iterdir())
@@ -211,23 +173,12 @@ def clear_artwork() -> int:
 
 # ── Record shims ──
 #
-# What comes back out of the cache is not a tidalapi object and never
-# pretends to be one: it carries exactly the fields the list views render,
-# and an id to resolve with when the user acts on it. Anything that needs
-# the real thing (a stream URL, a playlist edit) resolves through the
-# session first — see HeadlessTidalPlayer._resolve_track.
-#
-# The shims are also where the "corrupt → defaults, never raises" contract
-# for records lives. Two consumers build rows straight from machine-written
-# JSON through these constructors — the metadata index here and the saved
-# player state (player._restore_state) — and the second runs synchronously
-# at launch with no catch-all around it, so a corrupt field that merely
-# *rode along* would crash either the restore or the first frame that
-# renders it. The contract sits in the one place both import rather than
-# being copied per caller (three copies of a contract is how one goes
-# missing — see the guarded state reader's history), so: any json-decodable
-# record yields a shim whose every field has its documented type, with
-# wrong-typed fields reading as their defaults.
+# What comes out of the cache carries only the fields list views render, plus
+# an id to resolve through the session (HeadlessTidalPlayer._resolve_track).
+# These constructors are also where "corrupt → defaults, never raises" lives:
+# both the metadata index and player._restore_state (synchronous at launch, no
+# catch-all) build rows from machine-written JSON through them. Any
+# json-decodable record yields a shim whose fields have their documented types.
 
 
 class _Named:
@@ -237,29 +188,31 @@ class _Named:
         self.name = name
 
 
+class _Album(_Named):
+    __slots__ = ("cover",)
+
+    def __init__(self, name, cover=None):
+        super().__init__(name)
+        self.cover = cover
+
+
 def _clean_str(value):
     """A non-empty str, or None. Anything else is corruption, not a value."""
     return value if isinstance(value, str) and value else None
 
 
 def _clean_number(value):
-    """An int or float, or 0. bool is excluded on purpose: True is a number
-    to isinstance, but a duration of True is corruption, not one second."""
+    """An int or float, or 0. bool is excluded: True is corruption, not 1."""
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return value
     return 0
 
 
 class CachedTrack:
-    """A track as far as a list row is concerned.
-
-    Guaranteed typed, whatever the record held: `name` a non-empty str
-    (else "?"), `duration` an int or float (else 0), `artists` a list of
-    `_Named` built from the record's non-empty str elements only — a number
-    in an artists list is corruption, not an artist — and `album` a `_Named`
-    or None. `id` alone is kept verbatim: it is only compared and resolved,
-    never rendered or done arithmetic on. Never raises.
-    """
+    """A track as far as a list row is concerned. Never raises: `name` a
+    non-empty str (else "?"), `duration` a number (else 0), `artists` a list of
+    `_Named` from the non-empty str elements only, `album` an `_Album` (its
+    `name` a str, possibly empty, and `cover` a str or None) or None. `id` is kept verbatim."""
 
     cached = True
     __slots__ = ("id", "name", "duration", "artists", "album")
@@ -271,20 +224,18 @@ class CachedTrack:
         self.name = _clean_str(record.get("name")) or "?"
         self.duration = _clean_number(record.get("duration"))
         artists = record.get("artists")
-        self.artists = [_Named(n)
-                        for n in (artists if isinstance(artists, list) else [])
-                        if isinstance(n, str) and n]
+        self.artists = [_Named(artist)
+                        for artist in (artists if isinstance(artists, list) else [])
+                        if _clean_str(artist)]
         album = _clean_str(record.get("album"))
-        self.album = _Named(album) if album else None
+        cover = _clean_str(record.get("cover"))
+        self.album = _Album(album or "", cover) if album or cover else None
 
 
 class CachedPlaylist:
-    """A playlist as far as the playlists list is concerned.
-
-    Same guarantee as CachedTrack: `name` a non-empty str (else "?"),
-    `num_tracks` an int or float (else 0), `creator` a `_Named` or None,
-    `editable` a plain bool, `id` verbatim. Never raises.
-    """
+    """A playlist as far as the playlists list is concerned. Same guarantee as
+    CachedTrack: `num_tracks` a number (else 0), `creator` a `_Named` or None,
+    `editable` a bool."""
 
     cached = True
     __slots__ = ("id", "name", "num_tracks", "creator", "editable")
@@ -310,6 +261,7 @@ def track_record(track) -> dict:
         "duration": getattr(track, "duration", None),
         "artists": artists,
         "album": getattr(album, "name", None) if album else None,
+        "cover": _clean_str(getattr(album, "cover", None)) if album else None,
     }
 
 
@@ -324,10 +276,111 @@ def playlist_record(playlist, editable: bool) -> dict:
     }
 
 
+class CachedAlbum:
+    cached = True
+    wire_kind = "album"
+    __slots__ = ("id", "name", "artist", "cover", "num_tracks")
+
+    def __init__(self, record: dict):
+        record = record if isinstance(record, dict) else {}
+        self.id = record.get("id")
+        self.name = _clean_str(record.get("name")) or "?"
+        artist = _clean_str(record.get("artist"))
+        self.artist = _Named(artist) if artist else None
+        self.cover = _clean_str(record.get("cover"))
+        self.num_tracks = _clean_number(record.get("num_tracks"))
+
+
+class CachedArtist:
+    cached = True
+    wire_kind = "artist"
+    __slots__ = ("id", "name")
+
+    def __init__(self, record: dict):
+        record = record if isinstance(record, dict) else {}
+        self.id = record.get("id")
+        self.name = _clean_str(record.get("name")) or "?"
+
+
+class CachedMix:
+    cached = True
+    wire_kind = "mix"
+    __slots__ = ("id", "name")
+
+    def __init__(self, record: dict):
+        record = record if isinstance(record, dict) else {}
+        self.id = record.get("id")
+        self.name = _clean_str(record.get("name")) or "?"
+
+
+_KINDS_BY_CLASS = {"Track": "track", "Video": "track", "Album": "album", "Artist": "artist",
+                   "Playlist": "playlist", "UserPlaylist": "playlist", "Mix": "mix", "MixV2": "mix",
+                   "CachedTrack": "track", "CachedPlaylist": "playlist"}
+
+
+def kind_of(obj):
+    kind = getattr(obj, "wire_kind", None) or _KINDS_BY_CLASS.get(type(obj).__name__)
+    if kind:
+        return kind
+    if hasattr(obj, "duration") and hasattr(obj, "artists"):
+        return "track"
+    if hasattr(obj, "num_tracks") and hasattr(obj, "artist"):
+        return "album"
+    if hasattr(obj, "num_tracks") or hasattr(obj, "creator"):
+        return "playlist"
+    if hasattr(obj, "id") and hasattr(obj, "name"):
+        return "artist"
+    return None
+
+
+def _is_editable(obj) -> bool:
+    return type(obj).__name__ == "UserPlaylist" or bool(getattr(obj, "editable", False))
+
+
+def record_of(kind: str, obj) -> dict:
+    if kind == "track":
+        return track_record(obj)
+    if kind == "playlist":
+        return playlist_record(obj, _is_editable(obj))
+    if kind == "album":
+        artist = getattr(obj, "artist", None)
+        return {"id": getattr(obj, "id", None), "name": getattr(obj, "name", None),
+                "artist": getattr(artist, "name", None) if artist else None,
+                "cover": _clean_str(getattr(obj, "cover", None)),
+                "num_tracks": getattr(obj, "num_tracks", None)}
+    if kind == "mix":
+        return {"id": getattr(obj, "id", None),
+                "name": getattr(obj, "title", None) or getattr(obj, "name", None)}
+    return {"id": getattr(obj, "id", None), "name": getattr(obj, "name", None)}
+
+
+SHIMS = {"track": CachedTrack, "playlist": CachedPlaylist, "album": CachedAlbum,
+         "artist": CachedArtist, "mix": CachedMix}
+
+
+def item_record(obj) -> dict:
+    """Any list row, tagged with its kind; untagged records (older lists) are tracks."""
+    kind = kind_of(obj) or "track"
+    return {"_k": kind, **record_of(kind, obj)}
+
+
+def item_from(record):
+    kind = record.get("_k") if isinstance(record, dict) else None
+    return SHIMS.get(kind, CachedTrack)(record)
+
+
+def age_label(fetched, now=None) -> str:
+    """"cached 3 days ago": how old an offline list is (ADR-0009)."""
+    seconds = max(0, (time.time() if now is None else now) - (fetched or 0))
+    for size, unit in ((86400, "day"), (3600, "hour"), (60, "minute")):
+        if seconds >= size:
+            count = int(seconds // size)
+            return f"cached {count} {unit}{'' if count == 1 else 's'} ago"
+    return "cached just now"
+
+
 def format_gb(num_bytes: int) -> str:
-    """Bytes the way the settings page says them. Three decimals because two
-    would round a handful of tracks down to "0.00 GB" — the number is there to
-    show the cache filling up, so it has to move when a song lands."""
+    """Three decimals, so a handful of tracks does not round to "0.00 GB"."""
     return f"{num_bytes / BYTES_PER_GB:.3f} GB"
 
 
@@ -346,48 +399,66 @@ def _dir_size(path: Path) -> int:
 
 
 def _atomic_write_json(path: Path, payload: dict) -> None:
-    """Write-then-rename so readers never see a half-written file. Callers
-    keep their own mkdir and their own idea of what a failed write means."""
+    """Write-then-rename so readers never see a half-written file."""
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(payload))
     os.chmod(tmp, 0o600)
     os.replace(tmp, path)
 
 
+def _atomic_write_text(path: Path, text: str) -> None:
+    """A unique temp file per writer, so two processes never share one."""
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+def _file_stamp(path: Path):
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return st.st_ino, st.st_mtime_ns, st.st_size
+
+
+def _own_ids(records) -> list:
+    return [str(r.get("id")) for r in records if isinstance(r, dict)]
+
+
 class MetadataCache:
     """The cache the player talks to.
 
-    Whole-object replacement everywhere: neither the index nor the tracker
-    is ever mutated in place, so **every read is lock-free and correct** —
-    `get`, `audio_record`, `audio_value`, `cheapest_resident` and
-    `cached_usage` see one consistent generation of a dict, never a
-    half-written one. That is what the old "no locks" note was actually
-    right about, and it has not changed.
-
-    What it does not buy is *lost updates*, and that is a different
-    question with a different answer per store. The **index** is written
-    from one place at a time and can stay unlocked. The **tracker** cannot:
-    several threads write it concurrently through one shared MetadataCache
-    (see the tracker section below), so `_tracker_lock` serializes the
-    load-modify-save cycle of every tracker write. It is held only inside
-    `_mutate_tracker` — never across a disk walk, never by a caller — so
-    there is nothing to acquire twice.
+    The index is one file per list plus a small manifest of their sizes and
+    use. A read opens only its own list's file; a write replaces that file,
+    then the manifest (so a crash between the two leaves an orphan, never a
+    torn manifest). Every file is only ever replaced whole, so reads are
+    lock-free. Writes can lose updates: the index has one writer at a time
+    per process, but the tracker is written from
+    several threads through one shared instance, so `_tracker_lock` serializes
+    each load-modify-save inside `_mutate_tracker` (a leaf: held never across
+    a disk walk, never by a caller).
     """
 
-    def __init__(self, metadata: bool = True, songs: bool = True, budget_gb: int = 2):
-        # Two independent switches, not one ladder: keeping lists on disk and
-        # keeping tracks on disk are different sizes of promise
+    def __init__(self, metadata: bool = True, songs: bool = True, budget_gb: int = 2,
+                 metadata_cap: Optional[int] = None):
         self.metadata = metadata
         self.songs = songs
         self.budget_gb = budget_gb
-        self._index = None  # loaded from disk on first use
-        # Both measured on demand and remembered until something moves them —
-        # see audio_count / disk_bytes and invalidate_audio_count
+        self.metadata_cap = metadata_cap
+        self._manifest = None
+        self._manifest_stamp = None
+        self._lists = {}
+        self._touched = {}
+        self._migrated = False
+        self._index_lock = threading.RLock()
+        # Measured on demand; see invalidate_audio_count
         self._audio_count = None
         self._disk_bytes = None
-        # The tracker (see tracker_file). Loaded once, replaced whole, and
-        # written only under _tracker_lock — one MetadataCache is shared by
-        # every thread in the player, so the memo below is shared state
         self._tracker = None
         self._tracker_lock = threading.Lock()
 
@@ -406,65 +477,204 @@ class MetadataCache:
     def budget_bytes(self) -> int:
         return max(0, int(self.budget_gb)) * BYTES_PER_GB
 
-    def _load(self) -> dict:
-        """Read the index. Missing, corrupt or from a future version → empty,
-        never raises. Same contract as load_config."""
-        if self._index is not None:
-            return self._index
-        entries = {}
-        path = index_file()
-        try:
-            if path.exists():
-                data = json.loads(path.read_text())
-                if isinstance(data, dict) and data.get("version") == CACHE_VERSION:
-                    raw = data.get("entries")
-                    if isinstance(raw, dict):
-                        entries = {
-                            k: v for k, v in raw.items()
-                            if isinstance(v, dict) and isinstance(v.get("data"), list)
-                        }
-        except (json.JSONDecodeError, OSError, UnicodeDecodeError, ValueError) as e:
-            logger.debug("Unusable metadata cache, starting empty: %s", e)
-            entries = {}
-        self._index = entries
-        return entries
+    @property
+    def cap_bytes(self) -> int:
+        return METADATA_CAP_BYTES if self.metadata_cap is None else self.metadata_cap
 
-    def _save(self, entries: dict) -> None:
-        """Atomically replace the index, then bring the directory back inside
-        its budget. Best effort — a cache that can't be written is a slow
-        player, never a broken one."""
-        self._index = entries
-        try:
-            CACHE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
-            _atomic_write_json(
-                index_file(), {"version": CACHE_VERSION, "entries": entries})
-        except OSError as e:
-            logger.debug("Failed to write metadata cache: %s", e)
+    def _migrate(self) -> None:
+        """Split a single-file index from an older ticli into list files, once."""
+        if self._migrated:
             return
-        self.enforce_budget()
+        with self._index_lock:
+            if not self._migrated:
+                self._split_old_index()
+                self._migrated = True
+
+    def _split_old_index(self) -> None:
+        if not index_file().is_file():
+            return
+        try:
+            data = json.loads(index_file().read_text())
+        except (json.JSONDecodeError, OSError, ValueError) as e:
+            logger.debug("Unusable old metadata index, dropping it: %s", e)
+            data = None
+        raw = data.get("entries") if isinstance(data, dict) and data.get("version") == CACHE_VERSION else None
+        if isinstance(raw, dict):
+            manifest = self._load_manifest()
+            entries, own = dict(manifest["entries"]), manifest["own"]
+            for key, entry in raw.items():
+                if key in entries or not (isinstance(entry, dict) and isinstance(entry.get("data"), list)):
+                    continue
+                fetched = _clean_number(entry.get("fetched"))
+                size = self._write_list(key, fetched, entry["data"])
+                if size is None:
+                    return
+                entries[key] = {"fetched": fetched, "used": _clean_number(entry.get("used")) or fetched,
+                                "bytes": size}
+                if key == "playlists":
+                    own = _own_ids(entry["data"])
+            self._commit(own, entries)
+        with contextlib.suppress(OSError):
+            index_file().unlink()
+
+    def _load_manifest(self) -> dict:
+        """`{"own": [playlist ids], "entries": {key: {fetched, used, bytes, library}}}`.
+        Missing or corrupt → empty, never raises; re-read only when another process replaced it."""
+        stamp = _file_stamp(manifest_file())
+        if self._manifest is not None and stamp == self._manifest_stamp:
+            return self._manifest
+        manifest = {"own": [], "entries": {}}
+        try:
+            if stamp is not None:
+                data = json.loads(manifest_file().read_text())
+                if isinstance(data, dict) and data.get("version") == MANIFEST_VERSION:
+                    raw, own = data.get("entries"), data.get("own")
+                    manifest = {"own": own if isinstance(own, list) else [],
+                                "entries": {k: v for k, v in raw.items() if isinstance(v, dict)}
+                                if isinstance(raw, dict) else {}}
+        except (json.JSONDecodeError, OSError, ValueError) as e:
+            logger.debug("Unusable metadata manifest, starting empty: %s", e)
+        self._manifest, self._manifest_stamp = manifest, stamp
+        return manifest
+
+    def _write_list(self, key: str, fetched, records: list):
+        text = json.dumps({"key": key, "fetched": fetched, "data": records})
+        try:
+            lists_dir().mkdir(parents=True, exist_ok=True, mode=0o700)
+            _atomic_write_text(list_file(key), text)
+        except OSError as e:
+            logger.debug("Failed to write cached list %s: %s", key, e)
+            self._lists[key] = (None, {"fetched": fetched, "data": records})
+            return None
+        self._lists.pop(key, None)
+        return len(text)
+
+    def _read_list(self, key: str):
+        path = list_file(key)
+        stamp = _file_stamp(path)
+        held = self._lists.get(key)
+        if held and held[0] == stamp:
+            return held[1]
+        if stamp is None:
+            return None
+        try:
+            data = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError, ValueError) as e:
+            logger.debug("Unusable cached list %s: %s", key, e)
+            return None
+        if not (isinstance(data, dict) and data.get("key") == key and isinstance(data.get("data"), list)):
+            return None
+        entry = {"fetched": _clean_number(data.get("fetched")), "data": data["data"]}
+        self._lists[key] = (stamp, entry)
+        return entry
+
+    def _commit(self, own: list, entries: dict) -> None:
+        """Fold in the opens since the last write, evict down from the cap, then
+        replace the manifest; evicted files go only after it no longer names them."""
+        touched, self._touched = self._touched, {}
+        for key, used in touched.items():
+            if key in entries:
+                entries[key] = {**entries[key], "used": max(used, entries[key].get("used") or 0)}
+        own_keys = {f"playlist:{i}" for i in own}
+        entries = {key: {**entry, "library": key in LIBRARY_KEYS or key in own_keys
+                         or key.startswith(LIBRARY_PREFIXES)} for key, entry in entries.items()}
+        evicted = self._evicted(entries)
+        for key in evicted:
+            entries.pop(key)
+        text = json.dumps({"version": MANIFEST_VERSION, "own": own, "entries": entries})
+        try:
+            _atomic_write_text(manifest_file(), text)
+        except OSError as e:
+            logger.debug("Failed to write metadata manifest: %s", e)
+            return
+        self._manifest = {"own": own, "entries": entries}
+        self._manifest_stamp = _file_stamp(manifest_file())
+        for key in evicted:
+            self._lists.pop(key, None)
+            with contextlib.suppress(OSError):
+                list_file(key).unlink()
+        if evicted:
+            self._sweep_orphans(entries)
+
+    def _evicted(self, entries: dict) -> list:
+        """Over the cap, the keys to drop to get under EVICT_TO of it: least
+        recently opened first, the user's own library only after everything else."""
+        total = sum(_clean_number(e.get("bytes")) for e in entries.values())
+        if total <= self.cap_bytes:
+            return []
+        evicted = []
+        for key in sorted(entries, key=lambda k: (bool(entries[k].get("library")),
+                                                  _clean_number(entries[k].get("used")))):
+            if total <= self.cap_bytes * EVICT_TO:
+                break
+            evicted.append(key)
+            total -= _clean_number(entries[key].get("bytes"))
+        return evicted
+
+    @staticmethod
+    def _sweep_orphans(entries: dict) -> None:
+        """List files no manifest names (a writer that died between the two
+        renames). Only old ones: a fresh one may be another process mid-put."""
+        named = {list_file(k).name for k in entries} | {manifest_file().name}
+        cutoff = time.time() - ORPHAN_GRACE_SECONDS
+        try:
+            paths = list(lists_dir().iterdir())
+        except OSError:
+            return
+        for path in paths:
+            try:
+                if path.name not in named and path.suffix in (".json", ".tmp") \
+                        and path.stat().st_mtime < cutoff:
+                    path.unlink()
+            except OSError:
+                continue
 
     # ── generic entry access ──
 
     def get(self, key: str):
-        """Stored records for a key, or None if absent, stale or disabled."""
+        """Stored records for a key, or None if absent or disabled. Never expires (ADR-0009)."""
+        entry = self.entry(key)
+        return entry["data"] if entry else None
+
+    def entry(self, key: str):
+        """`{"fetched", "used", "data"}` for a key, from that list's file alone.
+        Marked as opened now in memory; the manifest learns it on the next write."""
         if not self.enabled:
             return None
-        entry = self._load().get(key)
-        if not entry:
+        self._migrate()
+        entry = self._read_list(key)
+        if entry is None:
             return None
-        fetched = entry.get("fetched") or 0
-        if time.time() - fetched > MAX_AGE_SECONDS:
-            return None
-        return entry["data"]
+        now = time.time()
+        self._touched[key] = now
+        return {**entry, "used": now}
+
+    def fetched_at(self, key: str):
+        entry = self.entry(key)
+        return (entry.get("fetched") or 0) if entry else None
 
     def put(self, key: str, records: list) -> None:
         if not self.enabled:
             return
-        now = time.time()
-        # Whole-dict replacement, so a reader never sees a partial update
-        entries = dict(self._load())
-        entries[key] = {"fetched": now, "used": now, "data": list(records)}
-        self._save(entries)
+        self._migrate()
+        records = list(records)
+        with self._index_lock:
+            now = time.time()
+            size = self._write_list(key, now, records)
+            if size is None:
+                return
+            manifest = self._load_manifest()
+            own = _own_ids(records) if key == "playlists" else manifest["own"]
+            entries = dict(manifest["entries"])
+            entries[key] = {"fetched": now, "used": now, "bytes": size}
+            self._commit(own, entries)
+
+    def put_items(self, key: str, objs) -> None:
+        self.put(key, [item_record(o) for o in objs or []])
+
+    def get_items(self, key: str):
+        records = self.get(key)
+        return [item_from(r) for r in records] if records is not None else None
 
     def clear(self) -> None:
         """Drop everything — the index, any cached audio, any cover art."""
@@ -473,33 +683,30 @@ class MetadataCache:
         clear_artwork()
 
     def clear_metadata(self) -> None:
-        """Forget the index. Turning metadata caching off has to mean the disk
-        is empty, not just unread."""
-        self._index = {}
-        try:
-            index_file().unlink()
-        except OSError:
-            pass
+        """Forget the index, on disk too."""
+        with self._index_lock:
+            self._manifest = self._manifest_stamp = None
+            self._lists.clear()
+            self._touched.clear()
+            try:
+                paths = [index_file(), *lists_dir().iterdir()]
+            except OSError:
+                paths = [index_file()]
+            for path in paths:
+                if path.suffix in (".json", ".tmp"):
+                    with contextlib.suppress(OSError):
+                        path.unlink()
 
     def clear_audio(self) -> tuple:
-        """Delete the cached tracks, by exact path, one at a time.
+        """Delete the cached tracks, by exact path, one at a time. Returns
+        (deleted, kept).
 
-        Clearing the cache clears it: nothing is skipped for being in use.
-        On POSIX, unlinking a file another process has open succeeds and that
-        process keeps its descriptor, so the track playing from a file that
-        has just been deleted plays on to its end (verified with mpv). If the
-        player does re-open it — the race where it had not opened it yet — it
-        exits at once and AudioPlayer.source_vanished / _monitor_playback
-        restart the track from the network where it left off. Windows is
-        stricter: a file open without delete-sharing raises instead, and that
-        file is reported as kept rather than silently forgotten.
-
-        Never a directory wipe: the list is the files ticli wrote (see
-        owned_audio_files), so an unrelated file sharing the directory is
-        left alone. Anything that can't be removed — already gone, no
-        permission, turned into a directory — is skipped rather than aborting
-        the rest, and the count is recomputed from what is really left.
-        Returns (deleted, kept).
+        Nothing is skipped for being in use: on POSIX the playing track keeps
+        its descriptor (verified with mpv), and if the player re-opens a
+        deleted file AudioPlayer.source_vanished / _monitor_playback restart
+        it from the network. On Windows a file open without delete-sharing
+        raises and is reported as kept. Only files from owned_audio_files are
+        touched; one that can't be removed does not abort the rest.
         """
         removed = kept = 0
         gone = []
@@ -507,38 +714,31 @@ class MetadataCache:
             try:
                 path.unlink()
                 removed += 1
-                gone.append(path.stem)
             except FileNotFoundError:
-                gone.append(path.stem)  # already gone is the state we wanted
+                pass  # already gone is the state we wanted
             except OSError as e:
                 logger.debug("Could not delete cached track %s: %s", path, e)
                 kept += 1
-        self.forget_cached(gone)  # the tracker is the cache; both go together
-        self.invalidate_audio_count()  # remeasure from disk, not from intent
+                continue
+            gone.append(path.stem)
+        self.forget_cached(gone)
+        self.invalidate_audio_count()
         return removed, kept
 
     # ── how much is on disk ──
 
     def audio_count(self) -> int:
-        """How many whole tracks are cached.
-
-        Counted once and remembered: the settings page repaints far more often
-        than the directory changes, and everything that can change it says so
-        (see invalidate_audio_count). Half-written ".part" files aren't songs.
-        """
+        """How many whole tracks are cached (".part" files aren't songs).
+        Remembered, because the settings page repaints far more often than the
+        directory changes."""
         if self._audio_count is None:
             self._audio_count = sum(
                 1 for p in owned_audio_files() if p.suffix != ".part")
         return self._audio_count
 
     def disk_bytes(self) -> int:
-        """What the cache is costing on disk, for the settings page.
-
-        The same sizing enforce_budget uses (total_bytes), just remembered:
-        the page repaints on every keystroke and stat-ing a full audio
-        directory each frame would be felt. Invalidated by the same events as
-        the song count, so the two can never disagree.
-        """
+        """total_bytes, remembered (the page repaints on every keystroke) and
+        invalidated with the song count."""
         if self._disk_bytes is None:
             self._disk_bytes = self.total_bytes()
         return self._disk_bytes
@@ -551,11 +751,11 @@ class MetadataCache:
     # ── typed access ──
 
     def get_playlists(self):
-        records = self.get(KEY_PLAYLISTS)
+        records = self.get("playlists")
         return [CachedPlaylist(r) for r in records] if records else None
 
     def put_playlists(self, playlists, editable_type=None) -> None:
-        self.put(KEY_PLAYLISTS, [
+        self.put("playlists", [
             playlist_record(p, editable_type is not None and isinstance(p, editable_type))
             for p in playlists
         ])
@@ -570,74 +770,34 @@ class MetadataCache:
     # ── local search index ──
 
     def iter_tracks(self):
-        """Every cached track record, with the playlist it came from.
-
-        What "search my own playlists" is served from — TIDAL has no
-        server-side API for that, so it can only ever be answered from an
-        index like this one. Disabled means disabled: with metadata caching
-        off this yields nothing rather than reading a file that shouldn't be
-        consulted, the same as every other read.
-        """
+        """Every cached track record, with the playlist it came from. Serves
+        "search my own playlists" (TIDAL has no API for it)."""
         if not self.enabled:
             return
-        for key, entry in self._load().items():
-            if not key.startswith("playlist:"):
-                continue
-            playlist_id = key.split(":", 1)[1]
-            for record in entry.get("data") or []:
-                yield playlist_id, record
+        self._migrate()
+        for key in list(self._load_manifest()["entries"]):
+            entry = self._read_list(key) if key.startswith("playlist:") else None
+            for record in (entry or {}).get("data") or []:
+                yield key.split(":", 1)[1], record
 
     # ── the cache tracker ──
     #
-    # The tracker is the source of truth for **intent and metadata**: what
-    # ticli meant to cache, at which tier, how often it has been played and
-    # when it was last played. The files are downstream of it.
+    # The tracker is the source of truth for intent and metadata (what ticli
+    # meant to cache, plays, last played); the disk is the source of truth for
+    # existence. `reconcile()` (off the UI thread, never per paint) drops rows
+    # whose file is gone and adopts files with no row at zero plays.
     #
-    # The disk stays the source of truth for **existence**. Songs deleted from
-    # the cache folder by hand have to be handled durably, so a tracker entry
-    # whose file is gone is a fact to absorb — dropped, and the totals
-    # corrected — never an error and never something to go on reporting. The
-    # two are reconciled by `reconcile()`, off the UI thread; the one thing
-    # that must not happen is a full directory walk on every paint, which is
-    # what the settings page used to do.
-    #
-    # Crash safety is the `.part`-and-rename discipline used everywhere else:
-    # the tracker is written atomically, and either order of a crash is
-    # survivable because reconcile() reads both sides. A tracker entry with no
-    # file is dropped; a file with no entry is adopted at zero plays, which is
-    # also how a cache from before the tracker existed is picked up.
-    #
-    # Inside one process the tracker has several writers and they are all on
-    # different threads: `note_played` on the playback monitor, `note_cached`
-    # and `enforce_budget`'s `forget_cached` on the download daemon, another
-    # `note_cached` on the refetch job, `reconcile` on a startup daemon, and
-    # `forget_cached` again on the bulk-download writer. They share one
-    # MetadataCache and therefore one `self._tracker` memo, so every one of
-    # them is a copy-modify-replace over the same object.
-    #
-    # Unlocked, two overlapping cycles keep only the later one's change, and
-    # the old note here called that acceptable: "the loser of a race loses
-    # one play count". That stopped being true the moment `forget_cached`
-    # joined the writers. A `note_played` that reads the memo before a delete
-    # and saves after it **resurrects** a row for a file that has just been
-    # unlinked — the settings page then counts a song that is not there and
-    # eviction weighs it — and a `forget_cached` landing beside a
-    # `note_cached` erases a file the cache really does hold. Neither is a
-    # play count.
-    #
-    # So every write goes through `_mutate_tracker`, which holds
-    # `_tracker_lock` across the *whole* load-modify-save: it is the load
-    # half that makes a concurrent writer's change vanish, so a lock around
-    # the save alone would fix nothing. The lock lives at the leaves only —
-    # `enforce_budget` and `clear_audio` reach the tracker through
-    # `forget_cached` and never hold it themselves, and `reconcile`'s
-    # directory listing and per-file stat happen outside it.
-    #
-    # Reads are still lock-free, and still right: the dict is only ever
-    # replaced whole, so a reader gets some generation of it, never a torn
-    # one. Two ticli *instances* still race for the file with no lock between
-    # them, by the project's rule — the loser loses that process's recent
-    # bookkeeping, and `reconcile()` corrects existence on the next start.
+    # Writers run on different threads (`note_played` on the playback monitor,
+    # `note_cached`, `forget_cached`, `reconcile`) over one shared `_tracker`
+    # memo. Unlocked, a `note_played` that straddles a `forget_cached`
+    # resurrects a row for an unlinked file, and a `forget_cached` beside a
+    # `note_cached` erases a file the cache holds. So every write goes through
+    # `_mutate_tracker`, which holds `_tracker_lock` across the whole
+    # load-modify-save (the load half is what loses a concurrent change). The
+    # lock lives at the leaves only: `enforce_budget` and `clear_audio` go
+    # through `forget_cached`, and `reconcile`'s directory walk is outside it.
+    # Two ticli instances still race with no lock between them; `reconcile()`
+    # corrects existence on the next start.
 
     def _load_tracker(self) -> dict:
         """Track id (as a string) → record. Missing or corrupt reads as empty."""
@@ -651,7 +811,7 @@ class MetadataCache:
                 if isinstance(raw, dict):
                     tracks = {k: v for k, v in raw.items() if isinstance(v, dict)}
         except (OSError, json.JSONDecodeError, UnicodeDecodeError, ValueError):
-            tracks = {}
+            pass
         self._tracker = tracks
         return tracks
 
@@ -665,19 +825,10 @@ class MetadataCache:
             logger.debug("Could not write the cache tracker: %s", e)
 
     def _mutate_tracker(self, change) -> None:
-        """Read the tracker, let `change` edit a private copy, save it.
-
-        The one read-modify-write cycle in this module, and the only thing
-        that takes `_tracker_lock` — every tracker writer funnels through it
-        so that "load" and "save" cannot be prised apart by another thread.
-        `change` mutates the dict it is handed and may return False for
-        "nothing moved", which skips the write entirely.
-
-        A leaf by construction: nothing reachable from `change` may touch
-        the tracker again, which is why the callers that delete files
-        (`enforce_budget`, `clear_audio`) hand their casualties to
-        `forget_cached` instead of removing rows themselves.
-        """
+        """Read the tracker, let `change` edit a private copy, save it. The only
+        user of `_tracker_lock`. `change` may return False for "nothing moved",
+        which skips the write. Nothing reachable from `change` may touch the
+        tracker again."""
         with self._tracker_lock:
             tracks = dict(self._load_tracker())
             if change(tracks) is False:
@@ -691,15 +842,9 @@ class MetadataCache:
         return self._load_tracker().get(str(track_id))
 
     def note_cached(self, track_id, ext: str, size: int, quality=None) -> None:
-        """A track just landed in the cache directory.
-
-        `quality` is the tier TIDAL actually *granted*, not the one that was
-        asked for — it is what makes "is this file already what a download at
-        this tier would fetch?" and "is this file below the tier I have now
-        set?" answerable without a request. None means "not known", which is
-        what every file cached before the tracker existed is, and which is
-        deliberately never treated as a match.
-        """
+        """A track just landed in the cache directory. `quality` is the tier
+        TIDAL actually granted, not the one asked for; None means unknown and
+        is never treated as a match."""
         if track_id is None or not self.keeps_audio:
             return
         key = str(track_id)
@@ -717,16 +862,8 @@ class MetadataCache:
         self._mutate_tracker(change)
 
     def note_played(self, track_id) -> None:
-        """One more point for this track, and the time it earned it.
-
-        `time.time()` stamped here rather than the filesystem's `atime`:
-        `relatime` makes that roughly daily-granular, which is useless for
-        ordering a listening session, and this is a write we control.
-
-        The increment is a read-modify-write and this runs on the monitor
-        thread, so it is one of the reasons `_mutate_tracker` exists: two
-        plays counted at once used to make one.
-        """
+        """One more play for this track, stamped with time.time() (the
+        filesystem's `atime` is daily-granular under `relatime`)."""
         if track_id is None or not self.keeps_audio:
             return
         key = str(track_id)
@@ -743,21 +880,17 @@ class MetadataCache:
         self._mutate_tracker(change)
 
     def forget_cached(self, track_ids) -> None:
-        """Drop entries for files that are no longer there. Whole-dict
-        replacement, and a no-op when nothing actually changed.
-
-        The removal is decided *inside* the lock rather than from a dict
-        read before it, because between the two a `note_cached` can add a
-        row this call never meant to take.
-        """
+        """Drop entries for files that are no longer there. The removal is
+        decided inside the lock, because a `note_cached` can add a row between
+        a read and the save."""
         keys = {str(t) for t in track_ids if t is not None}
         if not keys:
             return
 
         def change(tracks):
-            gone = [k for k in tracks if k in keys]
+            gone = keys & tracks.keys()
             for key in gone:
-                tracks.pop(key, None)
+                del tracks[key]
             return bool(gone)
 
         self._mutate_tracker(change)
@@ -765,23 +898,13 @@ class MetadataCache:
     def audio_value(self, track_id, playing: bool = False) -> tuple:
         """How much this track is worth keeping: `(plays, last played)`.
 
-        Garrett's rule, in one place so eviction and admission cannot drift:
-        **a point per play, and the oldest among the tracks with the fewest
-        plays goes first.** All one-play tracks oldest-first, then the
-        two-play ones, and so on — which is the whole reason it is not plain
-        LRU, because a four-hour binge on a new playlist must not evict
-        long-term staples.
+        The eviction rule: a point per play, and the oldest among the tracks
+        with the fewest plays goes first. Not plain LRU, so a four-hour binge
+        on a new playlist cannot evict long-term staples.
 
-        `playing=True` counts the play the track is earning *right now*. That
-        is what stops admission freezing the cache: without it a brand-new
-        track has zero plays, loses to everything, and once the cache is full
-        nothing new ever gets in again. With it, a song being listened to
-        displaces the oldest *other* one-play track and nothing else — which
-        is the same rule, honestly applied to a song that is being played.
-
-        Deliberately expressible at any moment, so the decision can move from
-        the start of a track to its end (where "was it actually listened to?"
-        is answerable) without the rule itself changing.
+        `playing=True` counts the play being earned right now. Without it a
+        new track has zero plays and loses to everything, so a full cache
+        would never admit anything again.
         """
         record = self.audio_record(track_id) or {}
         plays = int(record.get("plays") or 0) + (1 if playing else 0)
@@ -793,21 +916,10 @@ class MetadataCache:
     def should_cache(self, track_id, size: int = 0) -> bool:
         """Whether a track being played now is worth keeping.
 
-        **Refuse only under pressure.** With room in the budget the answer is
-        yes, exactly as it was before there was a rule at all — at the moment
-        a song starts you know almost nothing about it, and an unconditional
-        value test would freeze the cache into whatever it held the day the
-        rule was switched on. Only when the cache is full do both sides have
-        a history to compare, which is the whole of Garrett's decision.
-
-        Under pressure it is the value function and nothing else: the
-        candidate has to beat the cheapest thing already in there, i.e. the
-        track eviction would take next. A tie loses — the resident is already
-        on disk and moving bytes to replace it with an equal is work for
-        nothing.
-
-        One function, called from one place, so that moving the decision from
-        the start of a track to its end is a change of caller and not of rule.
+        Refuse only under pressure: with room in the budget the answer is yes
+        (a starting song has no history to judge by). When full, the candidate
+        must beat the cheapest resident, the track eviction would take next. A
+        tie loses, since replacing a track with an equal is wasted work.
         """
         if not self.keeps_audio:
             return False
@@ -823,23 +935,15 @@ class MetadataCache:
 
     def cheapest_resident(self, exclude=None):
         """The value of the cached track eviction would take next, or None.
-
-        Reads the tracker, not the directory — the point of maintaining an
-        index is that "what is in the cache and what is it worth" costs no
-        disk walk. Existence is still checked at the moment of eviction.
-        """
+        Reads the tracker, not the directory."""
         skip = str(exclude) if exclude is not None else None
         values = [self.audio_value(key) for key in self._load_tracker()
                   if key != skip]
         return min(values) if values else None
 
     def cached_usage(self) -> tuple:
-        """`(songs cached, what they cost)` — from the tracker.
-
-        The settings page's cache readout. Cheap by construction: no stat, no
-        directory walk, no JSON per track. It is corrected against the disk by
-        `reconcile()`, which is the only place the two are compared.
-        """
+        """`(songs cached, what they cost)` from the tracker, with no disk walk.
+        `reconcile()` corrects it against the disk."""
         count = 0
         total = 0
         for record in self._load_tracker().values():
@@ -853,22 +957,13 @@ class MetadataCache:
     def reconcile(self) -> tuple:
         """Make the tracker agree with the disk. Returns `(dropped, adopted)`.
 
-        Disk, not the tracker, is the authority on existence — a song deleted
-        from the cache folder by hand has to be handled durably, and the only
-        honest answer is to stop claiming it. The reverse is real too: a file
-        with no entry is adopted at zero plays, which covers a cache written
-        before the tracker existed and a crash between the rename and the
-        tracker write.
-
-        Not cheap (one directory listing plus a stat per file), so it is never
-        called from a paint — the player runs it once at startup on a daemon
-        thread, and again after anything that deletes files. That expense is
-        also why the scan stays *outside* `_tracker_lock`: holding a lock
-        across a directory walk would stall the monitor thread's play counts
-        behind the filesystem for no benefit, and the scan reads the disk,
-        which the lock does not protect anyway. Only the load-modify-save is
-        serialized, and it re-reads the tracker under the lock, so a
-        `note_cached` that landed during the walk is edited, not overwritten.
+        Rows for missing files are dropped; files with no row (a cache from
+        before the tracker, or a crash between rename and tracker write) are
+        adopted at zero plays. One directory listing plus a stat per file, so
+        it runs at startup on a daemon thread and after deletions, never from
+        a paint. The scan stays outside `_tracker_lock` (it would stall play
+        counts behind the filesystem); the change re-reads the tracker under
+        the lock, so a concurrent `note_cached` is edited, not overwritten.
         """
         if not self.keeps_audio:
             return 0, 0
@@ -891,10 +986,7 @@ class MetadataCache:
             for key, size in on_disk.items():
                 record = tracks.get(key)
                 if not isinstance(record, dict):
-                    # Zero plays and no known tier: unknown is not the same as
-                    # "the tier you have set now", and must never be mistaken
-                    # for it (that would silently hand someone the wrong
-                    # quality)
+                    # Unknown quality must never be mistaken for the current tier
                     tracks[key] = {"ext": "", "quality": None, "bytes": size,
                                    "plays": 0, "last": now, "at": now}
                     counts["adopted"] += 1
@@ -902,8 +994,6 @@ class MetadataCache:
                     record = dict(record)
                     record["bytes"] = size
                     tracks[key] = record
-            # dropped and adopted keys both change the dict, so this one
-            # comparison covers them and the bytes corrections alike
             return tracks != before
 
         self._mutate_tracker(change)
@@ -914,60 +1004,34 @@ class MetadataCache:
     # ── budget ──
 
     def total_bytes(self) -> int:
-        """Everything the cache directory is currently costing on disk."""
-        total = _dir_size(audio_dir())
-        try:
-            total += index_file().stat().st_size
-        except OSError:
-            pass
-        return total
+        """What the cached audio costs on disk. The metadata index has its own cap (ADR-0009)."""
+        return _dir_size(audio_dir())
 
     def enforce_budget(self) -> int:
         """Evict until the cache fits its budget. Returns bytes freed.
 
-        Audio goes first — it is by far the bulk and the cheapest to lose
-        (one re-download) — and in the order the tracker says: **fewest plays
-        first, and oldest first within the same number of plays.** Not plain
-        LRU, deliberately: a four-hour binge on a new playlist would evict
-        long-term staples under LRU, and the point of counting plays is that
-        it cannot. `audio_value` is that rule, in one place.
-
-        A file the tracker has never heard of sorts at `(0, 0)` and therefore
-        goes first, which is right — it is either litter or a leftover from
-        before the tracker, and `reconcile()` adopts anything real long before
-        a sweep sees it.
-
-        Only if the index alone still overshoots do metadata entries go,
-        oldest first. Called after every write, so nothing schedules a sweep —
-        being over budget is an event, not a state to poll for.
+        Audio goes first, in `audio_value` order: fewest plays, then oldest.
+        A file the tracker has never heard of sorts at `(0, 0)`: litter or
+        pre-tracker, and `reconcile()` adopts anything real long before.
+        Metadata is not counted here; it has its own cap (`_save`). Called
+        after every write; being over budget is an event, not a state to poll for.
         """
         budget = self.budget_bytes
         freed = 0
-        # Every path that changes the size on disk — a write, an eviction, a
-        # clear — comes through here, so this is the one place the remembered
-        # total has to be dropped. Re-measured lazily on the next paint.
+        # Every size change on disk comes through here, so drop the memo here
         self._disk_bytes = None
 
-        # Only ticli's own files are ever evicted — the budget is about what
-        # ticli put there, and a stranger's file in the same directory is not
-        # ours to reclaim
         files = []
         for entry in owned_audio_files():
             try:
                 size = entry.stat().st_size
             except OSError:
                 continue
-            # Our own stamp, never the filesystem's atime: `relatime` makes
-            # that roughly daily-granular, which cannot order a listening
-            # session. A half-written `.part` has no track id and no value.
-            # A half-written `.part` is worth strictly less than any song:
-            # it is either still arriving or litter from a kill, and either
-            # way it should go before a track somebody has listened to
+            # A `.part` is worth less than any song: still arriving, or litter
             value = (-1, 0.0) if entry.suffix == ".part" \
                 else self.audio_value(entry.stem)
             files.append((value, entry.name, size, entry))
-        # Name is only a tiebreak, so two files of equal value evict in a
-        # stated order rather than whatever the directory happened to yield
+        # Name is only a tiebreak, for a stated order between equal values
         files.sort(key=lambda f: (f[0], f[1]))
 
         total = self.total_bytes()
@@ -976,9 +1040,8 @@ class MetadataCache:
             if total <= budget:
                 break
             try:
-                # missing_ok, because a sweep racing another one (two
-                # downloads landing together) must not read "already gone" as
-                # "still costing us" and go on to evict a file that fits
+                # missing_ok: a racing sweep must not read "already gone" as
+                # "still costing us" and evict a file that fits
                 path.unlink(missing_ok=True)
             except OSError:
                 continue
@@ -986,29 +1049,6 @@ class MetadataCache:
             freed += size
             evicted.append(path.stem)
             self._audio_count = None  # a song just left the directory
-        # The tracker is what the cache *is*, so a file leaving it leaves the
-        # tracker in the same breath — otherwise the settings page would go on
-        # counting a song that is not there
         self.forget_cached(evicted)
 
-        if total <= budget:
-            return freed
-
-        # Still over on metadata alone. Rare (the index is single-digit MB
-        # even with hundreds of playlists) but the budget has to be real.
-        entries = dict(self._load())
-        for key in sorted(entries, key=lambda k: entries[k].get("used") or 0):
-            if total <= budget:
-                break
-            entries.pop(key, None)
-            self._index = entries
-            try:
-                _atomic_write_json(
-                    index_file(),
-                    {"version": CACHE_VERSION, "entries": entries})
-            except OSError:
-                break
-            new_total = self.total_bytes()
-            freed += max(0, total - new_total)
-            total = new_total
         return freed

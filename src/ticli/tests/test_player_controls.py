@@ -52,7 +52,7 @@ def _make_player(position=0.0, playing=True, seek_ok=True, index=1):
     p._play_offset = position
     p.audio = _FakeAudio(seek_ok)
     p._plays = []
-    p._play_track = lambda track, seek=0: p._plays.append((track.id, seek))
+    p._play_track = lambda track, seek=0, automatic=False: p._plays.append((track.id, seek))
     return p
 
 
@@ -387,7 +387,7 @@ class TestTruncatedStream:
     as end-of-track — correctly, by its own contract — so the monitor used to
     advance, and the user heard twelve seconds of a three-minute song with
     nothing said. Reachable by pausing longer than the ~1 h signed-URL life,
-    or by any network blip. ai/INCIDENTS #3 by another door.
+    or by any network blip. A failure must never look like a track ending.
     """
 
     def _audio(self):
@@ -762,3 +762,48 @@ class TestTheVolumeOverlayAndTheDownloadBox:
         p._handle_key("d")
         assert p._mode == p.MODE_SEARCH
         assert p._search_query == "d"
+
+
+class TestPositionResync:
+    """The monitor reads the backend's position over IPC; a pause landing
+    while that read is in flight must win over the stale answer."""
+
+    def test_a_pause_during_the_resync_keeps_where_it_paused(self):
+        import threading
+        import time
+
+        asked, answer, polled = threading.Event(), threading.Event(), threading.Event()
+
+        class SlowAudio:
+            is_playing, is_paused = True, False
+
+            def get_time_pos(self):
+                asked.set()
+                answer.wait(2)
+                return 30.0
+
+            def pause(self):
+                self.is_playing, self.is_paused = False, True
+
+            def poll_media_key(self):
+                if answer.is_set():
+                    polled.set()
+
+        p = _make_player(position=100.0)
+        p.audio = SlowAudio()
+        p._play_start_time = time.time()
+        p.running = True
+        thread = threading.Thread(target=p._monitor_playback, daemon=True)
+        thread.start()
+        assert asked.wait(2)
+        p._toggle_play()
+        paused_at = p._play_offset
+        answer.set()
+        assert polled.wait(2)
+        p.running = False
+        thread.join(timeout=2)
+
+        assert paused_at == pytest.approx(100.0, abs=1.0)
+        assert p._playing is False
+        assert p._play_start_time is None
+        assert p._play_offset == paused_at
