@@ -38,12 +38,162 @@ class QualityChoice(click.Choice):
         return super().convert(name, param, ctx)
 
 
-@click.group(invoke_without_command=True)
+# Registry commands the original agent verbs already cover, under their old names.
+COVERED = {"status", "search", "resolve", "library.playlists", "playlist.tracks",
+           "playlist.create", "playlist.add"}
+# Human verbs written by hand below; the registry supplies the rest.
+HUMAN_COVERED = {"status", "search", "pause", "resume", "next", "prev"}
+HUMAN_HIDDEN = {"login.reload", "history.add", "history.forget"}
+HUMAN_ALIASES = {"playlist.list": "library.playlists", "playlist.show": "playlist.tracks"}
+
+
+def _cost_line(spec) -> str:
+    if not spec.tidal:
+        return "Local: 0 requests, runs at once."
+    if spec.read:
+        return "Reads TIDAL: waits its turn in the 2 s queue, then answers with the data."
+    return "TIDAL action: queued 2 s apart; answered at once with queue position and ETA."
+
+
+class RegistryGroup(click.Group):
+    """One generated verb per player command, so a new command in `ticli.commands`
+    appears with no edit. The registry is imported when a verb is looked up or
+    listed (16 ms), never the player."""
+
+    skip: frozenset = frozenset()
+    aliases: dict = {}
+
+    def _registry(self) -> dict:
+        from ticli.commands import COMMANDS
+        return {n: c for n, c in COMMANDS.items() if n not in self.skip}
+
+    def list_commands(self, ctx):
+        words = [n.replace(".", " ") for n in {**self._registry(), **self.aliases}]
+        return sorted(self.commands) + sorted(words)
+
+    def help_for(self, dotted, spec) -> str:
+        raise NotImplementedError
+
+    def short_for(self, spec) -> str:
+        return _cost_line(spec)
+
+    def run(self, dotted, tokens) -> None:
+        raise NotImplementedError
+
+    def get_command(self, ctx, name):
+        if name in self.commands:
+            return self.commands[name]
+        dotted = name.replace(" ", ".")
+        target = self.aliases.get(dotted, dotted)
+        spec = self._registry().get(target)
+        if spec is None:
+            return None
+
+        def callback(tokens):
+            self.run(target, tokens)
+
+        return click.Command(
+            name.replace(".", " "), callback=callback,
+            params=[click.Argument(["tokens"], nargs=-1, type=click.UNPROCESSED)],
+            context_settings={"ignore_unknown_options": True},
+            help=self.help_for(target, spec), short_help=self.short_for(spec))
+
+    def resolve_command(self, ctx, args):
+        if len(args) >= 2 and not args[0].startswith("-"):
+            dotted = f"{args[0]}.{args[1]}"
+            if dotted in self.aliases or dotted in self._registry():
+                return dotted.replace(".", " "), self.get_command(ctx, dotted), args[2:]
+        return super().resolve_command(ctx, args)
+
+
+def _shape(spec) -> str:
+    return " ".join(f"[{p}...]" if p.endswith("*") else f"[{p}]" for p in spec.params) or "(none)"
+
+
+class AgentGroup(RegistryGroup):
+    skip = frozenset(COVERED)
+
+    def help_for(self, dotted, spec) -> str:
+        return (f"`{dotted}`. {_cost_line(spec)}"
+                + (" DANGEROUS: needs that switch on." if spec.dangerous is True else "")
+                + f"\n\nArgs {_shape(spec)}: positional, key=value, or one JSON object.")
+
+    def run(self, dotted, tokens) -> None:
+        from ticli import agent as impl
+        impl.run_form(dotted, tokens)
+
+
+class HumanGroup(RegistryGroup):
+    skip = frozenset(HUMAN_COVERED | HUMAN_HIDDEN)
+    aliases = HUMAN_ALIASES
+
+    def short_for(self, spec) -> str:
+        return ("Local." if not spec.tidal else "Reads TIDAL." if spec.read else "TIDAL action.") \
+            + (" Asks y/N." if spec.dangerous else "")
+
+    def help_for(self, dotted, spec) -> str:
+        return (f"`{dotted}`. {self.short_for(spec)}"
+                + f"\n\nArgs {_shape(spec)}. Playlists, albums and artists take a name or id; "
+                  "songs take an id, a TIDAL URL, \"artist - title\" or current.")
+
+    def resolve_command(self, ctx, args):
+        # `ticli play <anything>`; `play album|track|...` keeps its own verbs. `queue` likewise.
+        if args and args[0] == "play" and not (len(args) > 1 and f"play.{args[1]}" in self._registry()):
+            return "play", self._play, args[1:]
+        if args and args[0] == "queue" and not (len(args) > 1 and f"queue.{args[1]}" in self._registry()):
+            return "queue", self._queue, args[1:]
+        return super().resolve_command(ctx, args)
+
+    @property
+    def _queue(self):
+        def callback(words, next_):
+            from ticli import humancli
+            if not words:
+                humancli.run("queue.list", {})
+                return
+            humancli.queue(words, next_)
+        return click.Command("queue", callback=callback,
+                             params=[click.Argument(["words"], nargs=-1, type=click.UNPROCESSED),
+                                     click.Option(["--next", "next_"], is_flag=True,
+                                                  help="Play it after the current track, not at the end.")],
+                             help="Add to the queue without replacing it: a song, album or playlist by "
+                                  "name, \"artist - title\", an id or a TIDAL URL, matched like `ticli play`. "
+                                  "Never starts playback. Bare `ticli queue` lists it; `ticli queue add|list|"
+                                  "play|remove` are the plain verbs.")
+
+    @property
+    def _play(self):
+        def callback(words):
+            from ticli import humancli
+            if not words:
+                humancli.play_saved()
+                return
+            humancli.play(words)
+        return click.Command("play", callback=callback,
+                             params=[click.Argument(["words"], nargs=-1, type=click.UNPROCESSED)],
+                             context_settings={"ignore_unknown_options": True},
+                             help="Play anything: an album, playlist, track or artist by name, or a TIDAL URL. "
+                                  "Your playlists match first with no request; else one TIDAL search. "
+                                  "`ticli play album NAME` etc. still work. Bare `ticli play` resumes "
+                                  "what was playing, like `ticli resume`.")
+
+    def run(self, dotted, tokens) -> None:
+        from ticli import humancli
+        humancli.verb(dotted, tokens)
+
+
+@click.group(cls=HumanGroup, invoke_without_command=True)
+@click.option("--key", envvar="TICLI_AI_KEY", default=None, help="The AI control key, when a script (not a terminal) runs a verb. Or TICLI_AI_KEY.")
 @click.option("--quality", default=None, type=QualityChoice(QUALITY_NAMES, case_sensitive=False), help="Audio quality for this run (overrides the saved setting)")
-@click.option("--login-flow", default=None, type=click.Choice(["device", "pkce"], case_sensitive=False), help="How to log in when there is no saved session. device (default) is quickest; pkce needs a paste but is the only flow TIDAL streams FLAC to. Settings can switch later.")
+@click.option("--login-flow", default=None, type=click.Choice(["device", "pkce"], case_sensitive=False), help="How to log in. device (default) is quickest; pkce needs a paste but is the only flow TIDAL streams FLAC to. With pkce, a player signed in by the device flow offers the upgrade. Settings can switch later.")
 @click.pass_context
-def cli(ctx, quality, login_flow):
+def cli(ctx, key, quality, login_flow):
     """Ticli - Terminal music player for TIDAL. Plain `ticli` runs the player.
+
+    \b
+    Verbs: `ticli play NAME`, `ticli queue NAME [--next]`, `ticli pause|resume|next|prev|status`,
+    `ticli start playlist NAME`, `ticli playlist add NAME SONG`, `ticli like`... A SONG is a track
+    id, a TIDAL URL, "artist - title" or current.
 
     \b
     AI or script? Run `ticli agent docs` — the complete programmatic
@@ -52,30 +202,81 @@ def cli(ctx, quality, login_flow):
     # A group with invoke_without_command rather than a command, so `ticli
     # agent` can hang off it; bare `ticli` still means the player, and the
     # player's import chain still stays out of `--help`.
+    ctx.obj = {"key": key}
     if ctx.invoked_subcommand is not None:
         return
-    from ticli.player import HeadlessTidalPlayer
-    HeadlessTidalPlayer(quality=quality, login_flow=login_flow).run()
+    from ticli.player import run_tui
+    run_tui(quality=quality, login_flow=login_flow)
 
 
-@cli.group()
-def agent():
+
+def _transport(name, doc):
+    def callback():
+        from ticli import humancli
+        humancli.transport(name)
+    callback.__doc__ = doc
+    return cli.command(name)(callback)
+
+
+for _name, _doc in (("pause", "Pause playback. One line, then exit; never starts the player."),
+                    ("resume", "Resume playback."), ("next", "Skip to the next track."),
+                    ("prev", "Back to the previous track."),
+                    ("status", "What is playing, in one line.")):
+    _transport(_name, _doc)
+
+
+@cli.command()
+@click.argument("kind", type=click.Choice(["playlist", "album", "artist"]), required=False)
+@click.argument("name", nargs=-1)
+@click.option("--no-tui", is_flag=True, help="Only start playback; don't open the TUI.")
+def start(kind, name, no_tui):
+    """Play a playlist, album or artist by name, then open the TUI here.
+
+    Your own playlists match case-insensitively with no TIDAL request; anything
+    else is one TIDAL search. Several matches print a numbered top 5: run
+    `ticli start playlist 2` to pick. Bare `ticli start` resumes what was
+    playing (if anything), then opens the TUI."""
+    from ticli import humancli
+    if kind is None:
+        humancli.start_saved(no_tui)
+        return
+    if not name:
+        raise click.UsageError(f"ticli start {kind} NAME: the {kind}'s name or id.")
+    humancli.start(kind, " ".join(name), no_tui)
+
+
+@cli.command("search")
+@click.argument("query", nargs=-1, required=True)
+@click.option("--type", "types", multiple=True, type=click.Choice(["track", "album", "artist", "playlist"]), help="Repeatable. Default: all four.")
+@click.option("--limit", default=10, show_default=True)
+def search_(query, types, limit):
+    """Search TIDAL. One request however many --type."""
+    from ticli import humancli
+    humancli.search(query, types, limit)
+
+
+@cli.group(cls=AgentGroup)
+@click.option("--key", envvar="TICLI_AI_KEY", default=None, help="The AI control key, if your human set one (or TICLI_AI_KEY).")
+@click.pass_context
+def agent(ctx, key):
     """Headless verbs for programs. Start with `ticli agent docs`.
 
     stdout is always one JSON object (docs excepted). Every verb is
     rate-limited by a cross-process throttle; a TIDAL 429 or bot-detection
     response stops ALL agent requests until a human runs `ticli agent
     unblock`. Errors are structured: {"ok": false, "error": <code>,
-    "message": ..., "hint": ...} with a nonzero exit.
+    "message": ..., "hint": ...} with a nonzero exit. The human's TUI
+    settings decide what agents may do; a refusal says what to ask them.
     """
+    ctx.obj = {**(ctx.obj or {}), **({"key": key} if key else {})}
 
 
 @agent.command()
 def docs():
     """The complete contract, as markdown: every verb with its cost and JSON
     shape, the rate rules, and workflows. Read this before anything else."""
-    from ticli.agent_docs import DOCS
-    click.echo(DOCS, nl=False)
+    from ticli.agent_docs import render
+    click.echo(render(), nl=False)
 
 
 @agent.command()
@@ -145,10 +346,22 @@ def playlist_add(playlist_id, track_ids):
     impl.playlist_add(playlist_id, track_ids)
 
 
+@agent.command("do")
+@click.argument("commands", required=False)
+def do_(commands):
+    """Run a JSON array of commands in order, coalescing adds and likes, with one
+    combined reply. Items are {"cmd": "playlist.add", "args": {...}} or verb
+    strings like "playlist add <id> 1 2". Reads the array from stdin if omitted."""
+    import sys
+
+    from ticli import agent as impl
+    impl.do(commands if commands is not None else sys.stdin.read())
+
+
 @agent.command()
 def unblock():
     """Clear a tripped rate-limit stop. For humans, after investigating —
-    an agent must never run this."""
+    works only from a terminal; an agent must never run this."""
     from ticli import agent as impl
     impl.unblock()
 

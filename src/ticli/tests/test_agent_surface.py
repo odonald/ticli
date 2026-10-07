@@ -1,18 +1,19 @@
 """The agent surface: JSON contract, throttle enforcement, resolve ranking.
 
 Two of these are regression tests for failures that actually happened on
-2026-08-25, the session that motivated the feature (see HISTORY):
+2026-08-25, the session that motivated the feature:
 
 - an agent fired ~30 requests in seconds because the rate rules lived in
   Markdown (TestThrottle asserts the brake is now in the request path);
 - a resolver whose remix penalty outweighed its artist bonus served
   "The Journey" by H.E.R. for Folamour's (TestResolve replays it).
 
-Everything runs against fakes — zero live requests, per WORKING-RULES. The
+Everything runs against fakes — zero live requests (docs/adr/0001-tidal-rate-limits.md).
+The
 throttle tests inject `now`/`sleep` and then assert the *file on disk*,
 because the reservation arithmetic and the trip record are the observable
-reality here; a test that only checked return values would be the shape of
-INCIDENTS #2.
+reality here; a test that only checked return values could stay green over
+a brake that never engaged.
 """
 
 import json
@@ -21,7 +22,10 @@ import pytest
 from click.testing import CliRunner
 
 from ticli import agent as agent_mod
+from ticli import ipc
 from ticli.cli import cli
+from ticli.tests.agent_harness import GYM, ROAD, Harness
+from ticli.tests.fakes import FakeResponse, FakeTidal
 from ticli.utils import throttle
 
 
@@ -50,15 +54,34 @@ class FakeTrack:
         self.explicit = False
 
 
-def fake_session_returning(tracks, calls):
-    """A session whose search() answers with `tracks` and counts into `calls`."""
+@pytest.fixture(autouse=True)
+def spawned(monkeypatch):
+    """No test starts a real player: it would use the owner's real session."""
+    calls = []
 
-    class FakeSession:
-        def search(self, query, models=None, limit=50, offset=0):
-            calls.append(query)
-            return {"tracks": list(tracks)}
+    def spawn(*a, **kw):
+        calls.append(a)
+        return "error: no player in tests"
+    monkeypatch.setattr(ipc, "spawn_player", spawn)
+    return calls
 
-    return FakeSession()
+
+@pytest.fixture
+def player():
+    made = []
+
+    def _make(**kw):
+        made.append(Harness(**kw))
+        return made[-1]
+
+    yield _make
+    for h in made:
+        h.stop()
+
+
+def agent(*args, **kw):
+    result = CliRunner().invoke(cli, ["agent", *args], **kw)
+    return result, json.loads(result.output)
 
 
 @pytest.fixture
@@ -138,50 +161,29 @@ class TestThrottle:
 
 
 class TestEveryRequestIsThrottled:
-    def test_search_acquires_before_calling(self, monkeypatch, stored_tokens, capsys):
-        order = []
-        monkeypatch.setattr(throttle, "acquire", lambda **kw: order.append("acquire"))
-        calls = []
-        session = fake_session_returning([FakeTrack(1, "Baby", ["Four Tet"])], calls)
-        monkeypatch.setattr(agent_mod, "_session", lambda: session)
-        real_search = session.search
-        session.search = lambda *a, **kw: (order.append("request"), real_search(*a, **kw))[1]
-        agent_mod.search("four tet baby", ("track",), 10)
-        assert order == ["acquire", "request"]
+    def test_search_goes_through_the_players_queue(self, player):
+        h = player(session=FakeTidal(search_tracks=[FakeTrack(1, "Baby", ["Four Tet"])]))
+        result, out = agent("search", "four tet baby")
+        assert result.exit_code == 0 and out["tracks"][0]["title"] == "Baby"
+        assert out["cost"]["requests"] == 1 and h.session.requests == ["GET search"]
+        assert throttle.next_free_at() == h.clock() + throttle.MIN_INTERVAL_SECONDS
 
-    def test_a_429_trips_the_stop_and_reports_structured(self, monkeypatch, stored_tokens, capsys):
-        class FakeResponse:
-            status_code = 429
-            def json(self):
-                return {}
-
-        class Boom(Exception):
-            response = FakeResponse()
-
-        class FakeSession:
-            def search(self, *a, **kw):
-                raise Boom("too many requests")
-
-        monkeypatch.setattr(agent_mod, "_session", lambda: FakeSession())
-        with pytest.raises(SystemExit) as exc:
-            agent_mod.search("q", ("track",), 10)
-        assert exc.value.code == 1
-        out = json.loads(capsys.readouterr().out)
-        assert out["ok"] is False
-        assert out["error"] == "rate_limited"
+    def test_a_429_trips_the_stop_and_reports_structured(self, player):
+        h = player()
+        h.session.request_session.answers = [FakeResponse(429)]
+        result, out = agent("search", "q")
+        assert result.exit_code == 1
+        assert out["ok"] is False and out["error"] == out["code"] == "rate_limited"
         assert "unblock" in out["hint"]
-        # The trip is on disk, where the NEXT invocation (a new process)
-        # finds it — that persistence is the entire point
+        # The trip is on disk, where the NEXT invocation (a new process) finds it.
         assert json.loads(throttle._throttle_path().read_text())["tripped"]["reason"] == "http_429"
 
-    def test_tripped_state_fails_fast_without_a_request(self, monkeypatch, stored_tokens, capsys):
+    def test_tripped_state_fails_fast_without_a_request(self, player):
+        h = player()
         throttle.trip("http_429")
-        requests_made = []
-        session = fake_session_returning([], requests_made)
-        monkeypatch.setattr(agent_mod, "_session", lambda: session)
-        with pytest.raises(SystemExit):
-            agent_mod.search("q", ("track",), 10)
-        assert requests_made == []  # stopped means stopped
+        result, out = agent("search", "q")
+        assert result.exit_code == 1 and out["error"] == "rate_limited"
+        assert h.session.requests == []  # stopped means stopped
 
 
 # ---------------------------------------------------------------------------
@@ -198,13 +200,14 @@ FOLAMOUR_FIELD = [
 
 
 class TestResolve:
+    @pytest.fixture(autouse=True)
+    def _player(self, player):
+        self.player = player
+
     def _resolve(self, monkeypatch, capsys, tracks, artist, title):
-        calls = []
-        monkeypatch.setattr(agent_mod, "_session",
-                            lambda: fake_session_returning(tracks, calls))
-        monkeypatch.setattr(throttle, "acquire", lambda **kw: None)
-        agent_mod.resolve(artist, title, 10)
-        return json.loads(capsys.readouterr().out), calls
+        h = self.player(session=FakeTidal(search_tracks=tracks))
+        _, out = agent("resolve", "--artist", artist, "--title", title)
+        return out, h.session.requests
 
     def test_the_her_incident_cannot_recur(self, monkeypatch, stored_tokens, capsys):
         """Replays 2026-08-25 exactly: an exact-title wrong-artist hit, the
@@ -277,6 +280,8 @@ class TestCliContract:
         out = json.loads(result.output)
         assert out == {
             "ok": True,
+            "ai_control": {"allow_ai_control": True, "allow_dangerous_commands": False,
+                           "key_required": False},
             "session_stored": True,
             "flow": "pkce",
             "flac_capable": True,
@@ -287,60 +292,91 @@ class TestCliContract:
             },
         }
 
-    def test_not_logged_in_is_a_structured_error(self, monkeypatch):
-        monkeypatch.setattr(agent_mod, "load_tokens", lambda: None)
-        runner = CliRunner()
-        result = runner.invoke(cli, ["agent", "search", "anything"])
+    def test_not_logged_in_is_a_structured_error(self, monkeypatch, spawned):
+        monkeypatch.setattr(ipc, "spawn_player", lambda *a, **kw: spawned.append(a) or "login")
+        result, out = agent("search", "anything")
         assert result.exit_code == 1
-        out = json.loads(result.output)
-        assert out["ok"] is False
-        assert out["error"] == "not_logged_in"
-        assert "hint" in out
+        assert out["ok"] is False and out["error"] == "not_logged_in"
+        assert "log in" in out["hint"] and len(spawned) == 1
 
-    def test_playlist_create_and_add_shapes(self, monkeypatch, stored_tokens):
-        created = []
-        added = []
-
-        class FakePlaylist:
-            id = "pl-1"
-            name = "Morning Uplift"
-            num_tracks = 0
-            description = ""
-            def add(self, ids):
-                added.extend(ids)
-                return list(range(len(ids)))
-            def tracks(self):
-                return []
-
-        class FakeUser:
-            def create_playlist(self, name, description):
-                created.append((name, description))
-                return FakePlaylist()
-
-        class FakeSession:
-            user = FakeUser()
-            def playlist(self, pid):
-                assert pid == "pl-1"
-                return FakePlaylist()
-
-        monkeypatch.setattr(agent_mod, "_session", lambda: FakeSession())
-        monkeypatch.setattr(throttle, "acquire", lambda **kw: None)
-        runner = CliRunner()
-
-        result = runner.invoke(cli, ["agent", "playlist", "create", "Morning Uplift"])
+    def test_playlist_create_and_add_shapes(self, player):
+        h = player()
+        result, out = agent("playlist", "create", "Morning Uplift")
         assert result.exit_code == 0
-        out = json.loads(result.output)
-        assert out["playlist"] == {"id": "pl-1", "name": "Morning Uplift",
-                                   "num_tracks": 0, "description": ""}
-        assert created == [("Morning Uplift", "")]
+        new_id = out["playlist"]["id"]
+        assert out["playlist"] == {"id": new_id, "name": "Morning Uplift", "num_tracks": 0,
+                                   "description": ""}
+        assert h.session.playlists[new_id].name == "Morning Uplift"
 
-        result = runner.invoke(cli, ["agent", "playlist", "add", "pl-1", "11", "22"])
+        result, out = agent("playlist", "add", new_id, "11", "22")
         assert result.exit_code == 0
-        out = json.loads(result.output)
-        assert out == {"ok": True, "playlist_id": "pl-1", "requested": 2, "added": 2}
-        assert added == ["11", "22"]  # ids reach the API as strings
+        assert {k: out[k] for k in ("ok", "playlist_id", "requested", "queued")} == {
+            "ok": True, "playlist_id": new_id, "requested": 2, "queued": 1}
+        h.idle()
+        assert h.session.playlists[new_id].adds == [["11", "22"]]  # ids reach the API as strings
 
-    def test_unblock_via_cli_clears_a_real_trip(self, stored_tokens):
+    def test_every_registry_command_is_a_verb(self):
+        from ticli.cli import COVERED
+        from ticli.commands import COMMANDS
+        result = CliRunner().invoke(cli, ["agent", "--help"])
+        for name in set(COMMANDS) - COVERED:
+            assert name.replace(".", " ") in result.output, name
+
+    def test_a_generated_verb_runs_in_the_player(self, player):
+        h = player()
+        result, out = agent("queue", "remove", "2")
+        assert result.exit_code == 0 and out["result"] == {"queue_length": 2}
+        assert [t.id for t in h.core._queue] == [1, 2]
+        result, out = agent("queue", "remove", "index=0")  # the playing entry: plays the next
+        h.idle()
+        assert out["ok"] and [t.id for t in h.core._queue] == [2]
+        result, out = agent("queue", "remove", "x", "y")
+        assert result.exit_code == 1 and out["code"] == "bad_args"
+
+    def test_do_reads_a_batch_from_stdin_and_merges_adds(self, player):
+        h = player()
+        batch = json.dumps([f"playlist add {ROAD} 1",
+                            {"cmd": "playlist.add", "args": {"id": ROAD, "track_ids": [2]}},
+                            "queue list"])
+        result, out = agent("do", input=batch)
+        assert result.exit_code == 0 and out["ok"]
+        adds, merged, listed = out["result"]
+        assert adds["job"] == merged["job"] and merged["merged"].startswith("2 adds")
+        assert len(listed["result"]["tracks"]) == 3
+        h.idle()
+        assert h.road.adds == [["1", "2"]]
+        assert h.session.requests == [f"POST playlists/{ROAD}/items", f"GET playlists/{ROAD}"]
+
+    def test_status_lists_what_the_running_player_has_queued(self, player, monkeypatch):
+        h = player()
+        monkeypatch.setattr(agent_mod, "_player_running", lambda: True)
+        h.hold()
+        agent("playlist", "add", ROAD, "1")
+        agent("playlist", "add", ROAD, "2")
+        _, out = agent("status")
+        assert out["pending"] == [{"job": 1, "cmd": "playlist.add", "eta_s": 4.0, "merged": 2}]
+        assert out["state"]["pending"] == 1 and "status" in out["next"]
+        h.release()
+        _, out = agent("status")
+        assert out["pending"] == [] and out["done"][0]["ok"] is True
+
+    def test_a_typical_reply_stays_small(self, player):
+        player()
+        for args in (("pause",), ("playlist", "add", ROAD, "1"), ("next",)):
+            result = CliRunner().invoke(cli, ["agent", *args])
+            assert result.exit_code == 0 and len(result.output) < 450, result.output
+
+    def test_unblock_without_a_terminal_is_refused_and_keeps_the_trip(self, stored_tokens):
+        throttle.trip("http_429")
+        result = CliRunner().invoke(cli, ["agent", "unblock"])  # CliRunner's stdin is no TTY
+        payload = json.loads(result.output)
+        assert result.exit_code == 1 and payload["error"] == "human_only"
+        assert "ask your human to run `ticli agent unblock` in a terminal" in payload["hint"]
+        assert json.loads(throttle._throttle_path().read_text())["tripped"] is not None
+
+    def test_unblock_via_cli_clears_a_real_trip(self, monkeypatch, stored_tokens):
+        from ticli import commands
+        monkeypatch.setattr(commands, "cli_caller", lambda stdin=None: commands.HUMAN)
         throttle.trip("http_429")
         runner = CliRunner()
         result = runner.invoke(cli, ["agent", "unblock"])
@@ -377,6 +413,12 @@ class TestAgentDocs:
 
         walk(agent_group, "ticli agent")
 
+    def test_every_registry_command_is_documented(self):
+        from ticli.commands import COMMANDS
+        docs = self._docs()
+        for name in COMMANDS:
+            assert f"(`{name}`)" in docs, f"undocumented command: {name}"
+
     def test_docs_carry_the_load_bearing_rules(self):
         """Not full prose assertions — the phrases an agent's behaviour
         hinges on: the trip procedure, the batching rule, what is not yet
@@ -384,7 +426,8 @@ class TestAgentDocs:
         docs = self._docs()
         assert "stop and report to the human" in docs   # the trip procedure
         assert "batch them, never add in a loop" in docs
-        assert "not in this surface yet" in docs         # playback honesty
+        assert "Ask your human; never edit config.json" in docs
+        assert "2 s apart" in docs and "ticli agent do" in docs
         assert "the only sanctioned path" in docs
         assert "Human-only" in docs                      # unblock ownership
 
@@ -411,43 +454,18 @@ class TestAgentDocs:
 
 
 class TestErrorClassification:
-    def _failing_session(self, status_code):
-        class FakeResponse:
-            def __init__(self, code):
-                self.status_code = code
-            def json(self):
-                return {}
-
-        class Boom(Exception):
-            pass
-
-        boom = Boom("kaput")
-        boom.response = FakeResponse(status_code)
-
-        class FakeSession:
-            def playlist(self, pid):
-                raise boom
-
-        return FakeSession()
-
-    def _invoke_show(self, monkeypatch, status_code):
-        monkeypatch.setattr(agent_mod, "_session",
-                            lambda: self._failing_session(status_code))
-        monkeypatch.setattr(throttle, "acquire", lambda **kw: None)
-        runner = CliRunner()
-        result = runner.invoke(cli, ["agent", "playlist", "show", "nope"])
-        assert result.exit_code == 1
-        return json.loads(result.output)
-
-    def test_a_404_is_not_found_not_an_outage(self, monkeypatch, stored_tokens):
-        out = self._invoke_show(monkeypatch, 404)
-        assert out["error"] == "not_found"
+    def test_a_404_is_not_found_not_an_outage(self, player):
+        player()
+        result, out = agent("playlist", "show", "aaaaaaaa-0000-4000-8000-000000000404")
+        assert result.exit_code == 1 and out["error"] == "not_found"
         assert "playlist list" in out["hint"]  # says where real ids come from
 
-    def test_other_failures_are_api_error_with_a_hint(self, monkeypatch, stored_tokens):
-        out = self._invoke_show(monkeypatch, 500)
-        assert out["error"] == "api_error"
-        assert "hint" in out  # the docs promise every code carries one
+    def test_other_failures_are_api_error_with_a_hint(self, player):
+        h = player()
+        h.session.request_session.answers = [FakeResponse(500)]
+        result, out = agent("playlist", "show", ROAD)
+        assert result.exit_code == 1 and out["error"] == "api_error"
+        assert out["hint"]  # the docs promise every code carries one
 
 
 class TestDocsGapFixes:
@@ -458,8 +476,217 @@ class TestDocsGapFixes:
         runner = CliRunner()
         docs = runner.invoke(cli, ["agent", "docs"]).output
         assert "never auto-create" in docs           # sim 1: missing playlist
-        assert "no destructive verb" in docs         # sim 5: delete request
         assert "from your own tally" in docs         # sim 7: trip mid-task
         assert "it proves the login, not the audio" in docs  # sim 4: --verify
         assert "not_found" in docs                   # audit: error codes
-        assert "Also not here yet" in docs           # audit: browse/settings
+
+
+class TestPermissions:
+    """`ticli agent` obeys the human's switches before it spends a request."""
+
+    @pytest.fixture
+    def no_player(self, monkeypatch, spawned):
+        connects = []
+        monkeypatch.setattr(ipc, "connect", lambda *a: connects.append(a))
+        return spawned, connects
+
+    def _settings(self, **values):
+        from ticli.utils import config as config_mod
+        config_mod.save_config({**config_mod.DEFAULTS, **values})
+
+    def test_ai_control_off_refuses_actions_without_starting_the_player(self, no_player):
+        self._settings(allow_ai_control=False)
+        for args in (("playlist", "add", ROAD, "1"), ("pause",), ("do", '["pause"]')):
+            result, out = agent(*args)
+            refusal = out["result"][0] if args[0] == "do" else out
+            assert result.exit_code == 1 and refusal["code"] == "ai_control_off", args
+            assert "never edit config.json" in refusal["fix"]
+        assert no_player == ([], [])
+
+    def test_ai_control_off_answers_reads_from_disk_without_the_player(self, no_player):
+        self._settings(allow_ai_control=False)
+        for args in (("playlist", "list"), ("queue", "list"), ("search", "x"),
+                     ("settings", "get"), ("do", '["queue list", "download list"]')):
+            result, out = agent(*args)
+            assert result.exit_code == 0 and out["ok"], args
+        assert out["result"][0]["result"]["source"] == "disk"
+        assert no_player == ([], [])
+
+    def test_a_failing_disk_read_is_one_json_error(self, no_player, monkeypatch):
+        from ticli.utils.cache import MetadataCache
+
+        def boom(self):
+            raise RuntimeError("corrupt")
+        monkeypatch.setattr(MetadataCache, "get_playlists", boom)
+        self._settings(allow_ai_control=False)
+        result, payload = agent("playlist", "list")
+        assert result.exit_code == 1 and payload["ok"] is False
+        assert payload["error"] == "local_read_failed" and payload["hint"]
+
+    def test_a_set_key_is_required(self, no_player):
+        from ticli.utils.config import hash_ai_key
+        self._settings(ai_control_key=hash_ai_key("open sesame"))
+        _, missing = agent("playlist", "list")
+        assert missing["error"] == "key_required"
+        assert no_player == ([], [])
+
+    def test_the_key_comes_from_the_environment_or_the_flag(self, player):
+        from ticli.utils.config import hash_ai_key
+        self._settings(ai_control_key=hash_ai_key("open sesame"))
+        h = player()
+        by_env, out_env = agent("playlist", "list", env={"TICLI_AI_KEY": "open sesame"})
+        _, out_flag = agent("--key", "open sesame", "queue", "list")
+        assert out_env["ok"] and out_flag["ok"]
+        assert [p["id"] for p in out_env["playlists"]] == [ROAD, GYM]
+        h.core.commands._sleep = lambda s: None
+        _, wrong = agent("pause", env={"TICLI_AI_KEY": "nope"})
+        assert wrong["code"] == "wrong_key"
+
+    def test_status_is_never_gated_and_reports_the_switches(self, stored_tokens):
+        from ticli.utils.config import hash_ai_key
+        self._settings(allow_ai_control=False, ai_control_key=hash_ai_key("k"))
+        payload = json.loads(CliRunner().invoke(cli, ["agent", "status"]).output)
+        assert payload["ok"]
+        assert payload["ai_control"] == {"allow_ai_control": False,
+                                         "allow_dangerous_commands": False,
+                                         "key_required": True}
+
+    def test_docs_state_the_honour_system(self):
+        from ticli.agent_docs import render
+        for phrase in ("Only the human can change them", "never edit config.json",
+                       "TICLI_AI_KEY", "Ask your human", "dangerous_off", "key_required"):
+            assert phrase in render(), phrase
+
+
+class TestAgentNamesAndSongs:
+    """`ticli agent <verb>` takes names and songs like `ticli <verb>`, at the same request cost."""
+
+    def _added(self, h, playlist):
+        h.idle()
+        return playlist.adds
+
+    def test_a_track_id_and_a_uuid_cost_nothing_to_resolve(self, player):
+        h = player()
+        result, out = agent("playlist", "add", ROAD, "251380837")
+        assert result.exit_code == 0 and out["ok"]
+        assert self._added(h, h.road) == [["251380837"]]
+        assert h.session.requests == [f"POST playlists/{ROAD}/items", f"GET playlists/{ROAD}"]
+
+    def test_an_own_playlist_name_is_found_locally(self, player):
+        from ticli.utils.cache import MetadataCache
+        h = player()
+        MetadataCache().put_playlists([h.road, h.gym])
+        result, out = agent("playlist", "add", "road trip", "251380837")
+        assert result.exit_code == 0 and out["playlist_id"] == ROAD
+        assert self._added(h, h.road) == [["251380837"]]
+        assert "GET search" not in h.session.requests
+        from ticli.tests.fakes import fake_track
+        h.gym.items = [fake_track(251380838)]
+        result, out = agent("play", "playlist", "Gym")
+        assert result.exit_code == 0 and out["ok"]
+        h.idle()
+        assert [t.id for t in h.core._queue] == [251380838]
+        assert "GET search" not in h.session.requests
+
+    def test_another_name_is_exactly_one_search(self, player):
+        from ticli.tests.fakes import fake_track
+        pid = "8f1b2c3d-1111-2222-3333-444455556666"
+        session = FakeTidal()
+        player(session=session)
+        session.search_playlists = [session.add_playlist(pid, "EDM Mix", [fake_track(251380837)])]
+        result, out = agent("playlist", "show", "edm mix")
+        assert result.exit_code == 0 and [t["id"] for t in out["tracks"]] == [251380837]
+        assert session.requests.count("GET search") == 1
+
+    def test_an_ambiguous_name_returns_candidates_and_saves_no_pick(self, player):
+        from ticli import humancli
+        from ticli.utils.cache import MetadataCache
+        h = player()
+        h.road.name, h.gym.name = "EDM one", "EDM two"
+        MetadataCache().put_playlists([h.road, h.gym])
+        result, out = agent("playlist", "add", "edm", "251380837")
+        assert result.exit_code == 1 and out["code"] == "ambiguous"
+        assert [c["id"] for c in out["candidates"]] == [ROAD, GYM]
+        assert not humancli._picks_file().exists()
+
+    def test_artist_dash_title_adds_only_when_confident(self, player):
+        from ticli.tests.fakes import fake_track
+        session = FakeTidal(search_tracks=[fake_track(251380837, "One More Time", ["Daft Punk"])])
+        h = player(session=session)
+        result, out = agent("playlist", "add", ROAD, "Daft Punk - One More Time")
+        assert result.exit_code == 0 and out["requested"] == 1
+        assert self._added(h, h.road) == [["251380837"]]
+        assert session.requests.count("GET search") == 1
+        session.search_tracks = [fake_track(251380838, "One More Time (Remix)", ["Daft Punk"])]
+        result, out = agent("like", "Daft Punk - One More Time")
+        assert result.exit_code == 1 and out["code"] == "not_confident"
+        assert out["candidates"][0]["id"] == "251380838"
+
+    def test_queue_add_takes_ids_songs_and_a_next_flag(self, player):
+        from ticli.tests.fakes import fake_track
+        session = FakeTidal(search_tracks=[fake_track(251380837, "Reach Out", ["Marc Rebillet"])])
+        h = player(session=session)
+        result, out = agent("queue", "add", "2", "--next")
+        assert result.exit_code == 0 and out["result"]["index"] == 1 and out["cost"]["requests"] == 0
+        result, out = agent("queue", "add", "Marc Rebillet - Reach Out")
+        assert result.exit_code == 0, out
+        assert out["result"]["tracks"][0]["title"] == "Reach Out" and out["result"]["position"] == "end"
+        assert [t.id for t in h.core._queue] == [1, 2, 2, 3, 251380837]
+        assert session.requests.count("GET search") == 1
+        assert len(result.output) < 800, result.output
+
+    def test_queue_add_takes_a_playlist_by_name(self, player):
+        from ticli.tests.fakes import fake_track
+        from ticli.utils.cache import MetadataCache
+        h = player()
+        MetadataCache().put_playlists([h.road, h.gym])
+        h.road.items = [fake_track(5), fake_track(6)]
+        result, out = agent("queue", "add", "playlist=road trip")
+        assert result.exit_code == 0, out
+        assert out["result"]["added"] == 2 and [t.id for t in h.core._queue][-2:] == [5, 6]
+        assert "GET search" not in h.session.requests
+
+    def test_queue_add_of_nothing_is_bad_args(self, player):
+        h = player()
+        result, out = agent("queue", "add")
+        assert result.exit_code == 1 and out["code"] == "bad_args" and len(h.core._queue) == 3
+
+    def test_ai_control_off_matches_own_playlists_only(self, monkeypatch, spawned):
+        from ticli.tests.fakes import fake_playlist
+        from ticli.utils import config as config_mod
+        from ticli.utils.cache import MetadataCache
+        connects = []
+        monkeypatch.setattr(ipc, "connect", lambda *a: connects.append(a))
+        config_mod.save_config({**config_mod.DEFAULTS, "allow_ai_control": False})
+        MetadataCache().put_playlists([fake_playlist(ROAD, "Road trip")])
+        result, out = agent("playlist", "show", "nothing like it")
+        assert result.exit_code == 1 and out["code"] == "not_found"
+        assert "not searched" in out["fix"] and spawned == [] and connects == []
+
+
+class TestKeyAndDocsFixes:
+    def test_the_top_level_key_reaches_agent_verbs(self, player):
+        from ticli.utils.config import DEFAULTS, hash_ai_key, save_config
+        save_config({**DEFAULTS, "ai_control_key": hash_ai_key("sesame")})
+        h = player()
+        result = CliRunner().invoke(cli, ["--key", "sesame", "agent", "pause"])
+        assert result.exit_code == 0, result.output
+        assert h.core._playing is False
+
+    def test_docs_say_create_waits_and_what_do_returns(self):
+        from ticli.agent_docs import render
+        docs = render()
+        create = next(line for line in docs.splitlines() if "(`playlist.create`)" in line)
+        assert "waits its turn and returns the result" in create
+        for phrase in ("Local\n  items before the first TIDAL item run immediately",
+                       "A queued item that fails later\n  skips nothing",
+                       "items queued before it still run", "one record per item, in order"):
+            assert " ".join(phrase.split()) in " ".join(docs.split()), phrase
+
+
+def test_docs_teach_queue_add():
+    from ticli.agent_docs import render
+    docs = " ".join(render().split())
+    for phrase in ("queue add ID... [--next]", "never starts playback", "Never `play track`: that replaces the queue",
+                   "`ticli agent queue add [track_ids...]` (`queue.add`): 0 requests for tracks already known"):
+        assert phrase in docs, phrase
