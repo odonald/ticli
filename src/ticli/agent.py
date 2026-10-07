@@ -1,37 +1,22 @@
 """The agent surface: ticli for callers that are programs.
 
-`ticli agent <verb>` is a headless, JSON-speaking sibling of the TUI, built
-after two sessions proved agents will otherwise interact with ticli the worst
-way — importing internals, writing throwaway scripts, and firing requests at
-a rate that has already gotten the owner's IP blocked by TIDAL once. Every
-verb here goes through `utils.throttle`, so the working rules' rate limits
-are enforced by code rather than by an agent having read them.
+`ticli agent <verb>` is a JSON-speaking client of the background player
+(ADR-0008), built after agents imported internals and fired requests at a
+rate that once got the owner's IP blocked by TIDAL. Verbs travel over the
+socket as caller=agent; the player queues and paces every TIDAL request
+(`ticli.agentq`), so the brake is code, not an agent having read the rules.
 
-Contract, held everywhere:
+- **stdout is exactly one JSON object.** Errors are `code`, `reason`, `fix`
+  and a nonzero exit; the original verbs keep `error`/`message`/`hint` too.
+- **AI control off never starts the player**: reads come from disk, the rest
+  is refused (ADR-0007).
+- `status` and `unblock` stay local; `status --verify` is the one request
+  made from this process, through `utils.throttle`.
 
-- **stdout is JSON, always exactly one object.** Success is `{"ok": true,
-  ...}`; failure is `{"ok": false, "error": <code>, "message": ...,
-  "hint": ...}` and a nonzero exit. Anything meant for a human goes to
-  stderr. An agent must never have to parse prose.
-- **Errors are structured and honest.** `not_logged_in`, `rate_limited`
-  (the trip — includes what tripped it and that a *human* clears it),
-  `auth_failed`, `api_error`, `not_found`. Never a stack trace on stdout,
-  never a silent empty result for what was actually a failure.
-- **Requests are counted and spaced.** Each verb documents its request cost
-  in `--help`; each network call takes one `throttle.acquire()` first. A 429
-  or a 401/subStatus-4006 trips the stop for every future agent call until
-  `ticli agent unblock`.
-
-This module must not import `ticli.player` — that is the whole TUI's import
-chain, and both `ticli --help` and `ticli agent --help` stay instant by
-keeping tidalapi and player imports inside the functions that need them.
-The playlist mutations here deliberately do not touch the running player's
-queue or state files; a live TUI notices new playlists the way it notices
-them changing on the server, by fetching.
+Must not import `ticli.player`: `ticli agent --help` stays instant.
 """
 
 import json
-import re
 import sys
 
 from ticli.utils import throttle
@@ -39,7 +24,7 @@ from ticli.utils.credential_store import load_tokens, save_tokens
 
 
 def emit(payload: dict) -> None:
-    json.dump(payload, sys.stdout, indent=2)
+    json.dump(payload, sys.stdout, separators=(",", ":"))
     sys.stdout.write("\n")
 
 
@@ -50,6 +35,32 @@ def fail(error: str, message: str, hint: str = "", **extra) -> "SystemExit":
     payload.update(extra)
     emit(payload)
     return SystemExit(1)
+
+
+# ---------------------------------------------------------------------------
+# Permissions (ADR-0007): the human's switches, read from config on every call
+
+
+def _permit(verb: str, offline: str = "") -> dict:
+    """Refuse what the switches don't allow. With AI control off, a verb that
+    has an `offline` twin is answered from disk instead (returned), never TIDAL."""
+    import click
+
+    from ticli.commands import AGENT, gate, offline_read
+    from ticli.utils.config import load_config
+
+    ctx = click.get_current_context(silent=True)
+    key = ((ctx.obj if ctx else None) or {}).get("key")
+    cfg = load_config()
+    refused = gate(verb, AGENT, key, cfg, read=bool(offline))
+    if refused:
+        raise fail(refused["code"], refused["reason"], hint=refused["fix"])
+    if offline and not cfg["allow_ai_control"]:
+        read = offline_read(offline, cfg=cfg)
+        if not read["ok"]:
+            raise fail(read["code"], read["reason"], hint=read["fix"])
+        return read["result"]
+    return {}
 
 
 # ---------------------------------------------------------------------------
@@ -89,12 +100,11 @@ def _trip_from(exc) -> None:
         record = throttle.trip("http_429", detail=str(exc))
         raise _tripped_exit(record)
     if status == 401:
-        sub = None
         try:
-            sub = response.json().get("subStatus")
+            sub_status = response.json().get("subStatus")
         except Exception:
-            pass
-        if sub == 4006:
+            sub_status = None
+        if sub_status == 4006:
             record = throttle.trip("substatus_4006", detail=str(exc))
             raise _tripped_exit(record)
         raise fail(
@@ -113,7 +123,7 @@ def _session():
     refreshed the token on the way in, the refreshed copy is saved back so
     the next invocation doesn't repeat the round trip.
     """
-    import tidalapi  # deferred: keep `ticli agent --help` instant
+    from ticli.utils.net import tidal_session  # deferred: keep `ticli agent --help` instant
 
     data = load_tokens()
     if not data:
@@ -122,7 +132,7 @@ def _session():
             "No stored TIDAL session.",
             hint="Run `ticli` interactively to log in (PKCE for FLAC).",
         )
-    session = tidalapi.Session()
+    session = tidal_session()
     try:
         session.load_oauth_session(
             data["token_type"],
@@ -185,54 +195,19 @@ def _api_call(fn, *args, **kwargs):
 
 
 # ---------------------------------------------------------------------------
-# Serialization — plain dicts an agent can rely on, never tidalapi objects
-
-
-def _track_json(t) -> dict:
-    album = getattr(t, "album", None)
-    return {
-        "id": t.id,
-        "title": t.name,
-        "artists": [a.name for a in (t.artists or [])],
-        "album": getattr(album, "name", None),
-        "duration_seconds": t.duration,
-        "explicit": bool(getattr(t, "explicit", False)),
-    }
-
-
-def _album_json(a) -> dict:
-    return {
-        "id": a.id,
-        "title": a.name,
-        "artists": [ar.name for ar in (getattr(a, "artists", None) or [])],
-        "num_tracks": getattr(a, "num_tracks", None),
-        "year": getattr(a, "year", None),
-    }
-
-
-def _artist_json(a) -> dict:
-    return {"id": a.id, "name": a.name}
-
-
-def _playlist_json(p) -> dict:
-    return {
-        "id": str(p.id),
-        "name": p.name,
-        "num_tracks": getattr(p, "num_tracks", None),
-        "description": getattr(p, "description", "") or "",
-    }
-
-
-# ---------------------------------------------------------------------------
 # Verbs
 
 
 def status(verify: bool) -> None:
     """Zero requests by default: report what is knowable without the network.
     `--verify` spends exactly one on `check_login`."""
+    from ticli.commands import switches
+    from ticli.utils.config import load_config
+
     data = load_tokens()
     payload = {
         "ok": True,
+        "ai_control": switches(load_config()),
         "session_stored": bool(data),
         "flow": ("pkce" if data.get("is_pkce") else "device") if data else None,
         # PKCE is the only flow TIDAL streams FLAC to; device gets AAC.
@@ -244,6 +219,7 @@ def status(verify: bool) -> None:
         },
     }
     if verify:
+        _permit("status.verify")
         if not data:
             raise fail("not_logged_in", "No stored TIDAL session.",
                        hint="Run `ticli` interactively to log in.")
@@ -251,7 +227,27 @@ def status(verify: bool) -> None:
         payload["verified"] = bool(_api_call(session.check_login))
         if payload["verified"]:
             _persist(session)
+    if payload["player_running"]:
+        payload.update(_live_status())
     emit(payload)
+
+
+def _live_status() -> dict:
+    """What the running player is doing and what it has queued; never starts one."""
+    from ticli import ipc
+
+    conn = ipc.connect()
+    if conn is None:
+        return {}
+    try:
+        reply = conn.request("status", caller="agent", key=_key(), timeout=5) or {}
+    finally:
+        conn.close()
+    if not reply.get("ok"):
+        return {}
+    result = reply.get("result") or {}
+    return {"state": reply.get("state"), "pending": result.get("pending", []),
+            "done": result.get("done", []), "next": reply.get("next", [])}
 
 
 def _player_running() -> bool:
@@ -279,143 +275,305 @@ def _player_running() -> bool:
     return False
 
 
-_SEARCH_TYPES = {"track": "tracks", "album": "albums",
-                 "artist": "artists", "playlist": "playlists"}
+# ---------------------------------------------------------------------------
+# Verbs over the player socket (ADR-0008): caller=agent, the player queues and paces
 
 
-def search(query: str, types: tuple, limit: int) -> None:
-    """One request regardless of how many types are asked for — limit is
-    per-type server-side, the same property the TUI's reservoir leans on."""
-    import tidalapi
+def _key():
+    import click
 
-    wanted = list(types) or ["track"]
-    models = {"track": tidalapi.Track, "album": tidalapi.Album,
-              "artist": tidalapi.Artist, "playlist": tidalapi.Playlist}
-    session = _session()
-    results = _api_call(
-        session.search, query,
-        models=[models[t] for t in wanted], limit=limit,
-    )
-    payload = {"ok": True, "query": query}
-    render = {"track": _track_json, "album": _album_json,
-              "artist": _artist_json, "playlist": _playlist_json}
-    for t in wanted:
-        payload[_SEARCH_TYPES[t]] = [render[t](x) for x in (results.get(_SEARCH_TYPES[t]) or [])]
+    ctx = click.get_current_context(silent=True)
+    return ((ctx.obj if ctx else None) or {}).get("key")
+
+
+_ZERO_COST = {"requests": 0, "wait_s": 0, "eta_s": 0}
+
+
+def _disk_reply(name: str, args: dict, cfg: dict) -> dict:
+    from ticli.agentq import compact_state, error_reply
+    from ticli.commands import offline_read
+
+    read = offline_read(name, args, cfg)
+    if not read["ok"]:
+        return error_reply(read)
+    state = compact_state(offline_read("status", {}, cfg).get("result") or {})
+    return {"ok": True, "result": read["result"], "state": state, "next": [],
+            "cost": _ZERO_COST}
+
+
+def _start_error(status: str) -> dict:
+    from ticli import ipc
+
+    if status == "login":
+        return {"ok": False, "code": "not_logged_in", "reason": "No usable stored TIDAL session.",
+                "fix": "Ask your human to run `ticli` in a terminal and log in."}
+    return {"ok": False, "code": "player_unavailable", "reason": status,
+            "fix": f"Tell your human; the player's log is {ipc.log_path()}."}
+
+
+def call(cmd: str, args: dict) -> dict:
+    """One agent command: refused, answered from disk, or sent to the player
+    (started if needed). Never starts the player while AI control is off."""
+    from ticli import ipc
+    from ticli.agentq import error_reply
+    from ticli.commands import AGENT, COMMANDS, gate
+    from ticli.utils.config import load_config
+
+    cfg, key = load_config(), _key()
+    items = args.get("commands") if cmd == "agent.do" else None
+    spec = COMMANDS.get(cmd)
+    if spec is None and items is None:
+        return {"ok": False, "code": "unknown_command", "reason": f"No command named {cmd!r}.",
+                "fix": "Run `ticli agent docs` for the command list."}
+    refused = gate(cmd, AGENT, key, cfg, read=bool(spec and spec.read) or items is not None)
+    if refused:
+        return error_reply(refused)
+    if not cfg.get("allow_ai_control", True):
+        return _disk_batch(items, cfg) if items is not None else _disk_reply(cmd, args, cfg)
+    conn, status = ipc.connect_or_start()
+    if conn is None:
+        return _start_error(status)
+    try:
+        response = conn.request(cmd, args, caller="agent", key=key)
+    finally:
+        conn.close()
+    if response is None:
+        return {"ok": False, "code": "player_gone", "reason": "The player closed the connection.",
+                "fix": "Run `ticli agent status`; queued actions may still have run."}
+    response.pop("id", None)
+    return response
+
+
+def _disk_batch(items, cfg) -> dict:
+    from ticli.commands import COMMANDS
+
+    records, ok = [], True
+    for item in items or []:
+        cmd = item.get("cmd") if isinstance(item, dict) else None
+        spec = COMMANDS.get(cmd)
+        if not ok:
+            records.append({"cmd": cmd, "ok": False, "code": "skipped"})
+            continue
+        if spec is None or not spec.read:
+            reply = {"ok": False, "code": "ai_control_off",
+                     "reason": "AI control is off; only reads from disk are allowed.",
+                     "fix": 'Ask your human to turn on "Allow AI control". Only your human can '
+                            "change this, in ticli's TUI settings; never edit config.json."}
+        else:
+            reply = _disk_reply(cmd, item.get("args") or {}, cfg)
+        ok = ok and reply["ok"]
+        records.append({"cmd": cmd, **{k: reply[k] for k in reply if k not in
+                                          ("state", "next", "cost")}})
+    return {"ok": ok, "result": records, "next": [], "cost": _ZERO_COST}
+
+
+def finish(payload: dict) -> None:
     emit(payload)
+    if not payload.get("ok"):
+        raise SystemExit(1)
 
 
-# Version qualifiers that make a track a different listen from the plain
-# title: a caller asking for "The Journey" plain does not mean the Alex
-# Martyn Remix. "feat. …" is deliberately NOT here — a featured guest is the
-# same recording, and treating it as a qualifier is what buried the real
-# Folamour original in this feature's motivating incident.
-_QUALIFIER = re.compile(
-    r"\b(remix|edit|rework|bootleg|dub|instrumental|acoustic|acapella|"
-    r"live|demo|radio|extended|vip|version|mix)\b", re.I)
-_FEAT = re.compile(r"\s*[(\[]\s*(?:feat|ft|featuring|with)\.?\s[^)\]]*[)\]]", re.I)
-_NOISE = re.compile(r"[^a-z0-9]+")
+def parse_value(token: str):
+    try:
+        return json.loads(token)
+    except ValueError:
+        return token
 
 
-def _normalize(title: str) -> str:
-    """Case/punctuation-blind comparison form, with featured-artist credits
-    stripped — 'The Journey (feat. Zeke Manyika)' answers to 'The Journey'."""
-    return _NOISE.sub(" ", _FEAT.sub("", title or "").lower()).strip()
+def form_args(name: str, tokens) -> dict:
+    """Positional tokens fill the command's params in order (a trailing `x*` takes the
+    rest as a list); `key=value` sets one by name, `--flag` sets it true; a lone JSON
+    object is the args."""
+    from ticli.commands import COMMANDS
+
+    tokens = list(tokens)
+    if len(tokens) == 1 and tokens[0].lstrip().startswith("{"):
+        args = json.loads(tokens[0])
+        if not isinstance(args, dict):
+            raise ValueError("args must be a JSON object")
+        return args
+    params = list(COMMANDS[name].params)
+    args: dict = {}
+    for token in tokens:
+        if token.startswith("--") and token[2:].isidentifier():
+            args[token[2:]] = True
+            continue
+        field, sep, value = token.partition("=")
+        if sep and field.isidentifier():
+            args[field] = parse_value(value)
+            continue
+        if not params:
+            raise ValueError(f"{name} takes no more positional arguments: {token!r}")
+        if params[0].endswith("*"):
+            args.setdefault(params[0][:-1], []).append(parse_value(token))
+        else:
+            args[params.pop(0)] = parse_value(token)
+    return args
+
+
+def split_form(words) -> tuple:
+    """`["playlist", "add", "X", "1"]` -> ("playlist.add", ["X", "1"])."""
+    from ticli.commands import COMMANDS
+
+    words = list(words)
+    if not words:
+        raise ValueError("empty command")
+    if len(words) >= 2 and f"{words[0]}.{words[1]}" in COMMANDS:
+        return f"{words[0]}.{words[1]}", words[2:]
+    head = words[0].replace(" ", ".")
+    if head in COMMANDS:
+        return head, words[1:]
+    raise ValueError(f"no command {' '.join(words[:2])!r}")
+
+
+def _needs_names(cmd: str, args: dict) -> bool:
+    from ticli import humancli
+
+    kind = humancli.NAMED.get(cmd)
+    if kind and "id" in args and not humancli.ID_FORM[kind].fullmatch(str(args["id"]).strip()):
+        return True
+    if cmd == "queue.add" and any(k in args and not humancli.ID_FORM[k].fullmatch(str(args[k]).strip())
+                                  for k in ("album", "playlist")):
+        return True
+    if cmd in humancli.QUEUE_ENTRY:
+        return False
+    given = args.get("track_ids", args.get("track_id"))
+    tokens = given if isinstance(given, list) else ([] if given is None else [given])
+    return any(not str(t).strip().isdigit() for t in tokens)
+
+
+def with_ids(cmd: str, args: dict) -> tuple:
+    """(cmd, args, None) with names and songs turned into ids as `ticli <verb>` does,
+    or (cmd, args, refusal): ambiguous names come back as `candidates` with ids."""
+    if not _needs_names(cmd, args):
+        return cmd, args, None
+    from ticli import humancli
+
+    link = humancli.Link(humancli.AGENT, picks=False)
+    try:
+        cmd, args = humancli.prepare(link, cmd, args)
+    except humancli.Stop as stop:
+        return cmd, args, stop.reply
+    finally:
+        link.close()
+    return cmd, args, None
+
+
+def _call_named(cmd: str, args: dict) -> dict:
+    cmd, args, refused = with_ids(cmd, args)
+    return refused if refused is not None else call(cmd, args)
+
+
+def run_form(name: str, tokens) -> None:
+    try:
+        args = form_args(name, tokens)
+    except ValueError as e:
+        raise fail_reply("bad_args", str(e), f"See `ticli agent {name.replace('.', ' ')} --help`.")
+    finish(_call_named(name, args))
+
+
+def fail_reply(code: str, reason: str, fix: str) -> SystemExit:
+    emit({"ok": False, "code": code, "reason": reason, "fix": fix})
+    return SystemExit(1)
+
+
+def do(text: str) -> None:
+    """A JSON array of {"cmd", "args"} objects or "verb args..." strings, in order."""
+    import shlex
+
+    try:
+        items = json.loads(text)
+        if not isinstance(items, list) or not items:
+            raise ValueError("do takes a non-empty JSON array")
+        commands = []
+        for item in items:
+            if isinstance(item, str):
+                name, tokens = split_form(shlex.split(item))
+                commands.append({"cmd": name, "args": form_args(name, tokens)})
+            elif isinstance(item, dict) and isinstance(item.get("cmd"), str):
+                name = item["cmd"].replace(" ", ".")
+                commands.append({"cmd": name, "args": item.get("args") or {}})
+            else:
+                raise ValueError(f"not a command: {item!r}")
+    except ValueError as e:
+        raise fail_reply("bad_args", str(e),
+                         'Pass a JSON array like ["pause", {"cmd": "playlist.add", '
+                         '"args": {"id": "...", "track_ids": [1]}}].')
+    finish(call("agent.do", {"commands": commands}))
+
+
+# ---------------------------------------------------------------------------
+# The original verbs: same top-level keys as before the player existed
+
+
+def _legacy(payload: dict, top) -> None:
+    if not payload.get("ok"):
+        payload = {**payload, "error": payload.get("code"), "message": payload.get("reason"),
+                   "hint": payload.get("fix") or "Report this to your human if it persists."}
+        finish(payload)
+        return
+    out = {"ok": True, **top(payload.get("result") or {})}
+    out.update({k: payload[k] for k in ("state", "next", "cost") if k in payload})
+    finish(out)
+
+
+def search(query: str, types: tuple, limit: int, offset: int = 0) -> None:
+    kinds = [f"{t}s" for t in (types or ("track",))]
+    _legacy(call("search", {"query": query, "types": kinds, "limit": limit, "offset": offset}),
+            lambda r: {"query": query, "offset": offset, **{k: r.get(k, []) for k in kinds},
+                       **({"source": r["source"]} if "source" in r else {})})
+
+
+def _flat(candidate):
+    if not candidate:
+        return candidate
+    rest = {k: v for k, v in candidate.items() if k != "track"}
+    return {**(candidate.get("track") or {}), **rest}
 
 
 def resolve(artist: str, title: str, limit: int) -> None:
-    """One search request, then local ranking with the failure modes this
-    surface exists to prevent encoded as rules:
-
-    - **Artist is a gate, not a score.** A candidate whose artists don't
-      include the requested one can appear in `candidates` but can never be
-      `best` while any artist-matched candidate exists, and never `confident`.
-      (The motivating incident: a scorer whose remix penalty could outweigh
-      its artist bonus picked "The Journey" by H.E.R. over Folamour's.)
-    - **Unrequested qualifiers demote within the gate.** A remix outranks
-      nothing plain, but it still resolves when it is all there is — reported
-      as such, so the caller can decide instead of being silently served one.
-    - **`confident` is strict**: artist-matched, normalized-title equal, no
-      unrequested qualifier. Anything less is the caller's judgement call,
-      and the ranked list is there for it to make one.
-    """
-    import tidalapi
-
-    session = _session()
-    results = _api_call(
-        session.search, f"{artist} {title}",
-        models=[tidalapi.Track], limit=limit,
-    )
-    want_artist = _normalize(artist)
-    want_title = _normalize(title)
-    asked_qualified = bool(_QUALIFIER.search(title or ""))
-
-    candidates = []
-    for t in results.get("tracks") or []:
-        names = " ".join(a.name for a in (t.artists or []))
-        artist_match = want_artist in _normalize(names)
-        got_title = _normalize(t.name)
-        title_exact = got_title == want_title
-        qualifier = (not asked_qualified) and bool(_QUALIFIER.search(t.name or ""))
-        # Rank *within* the artist gate; the gate itself is the sort's first key.
-        score = (2 if title_exact else (1 if want_title in got_title else 0)) - (1 if qualifier else 0)
-        candidates.append({
-            **_track_json(t),
-            "artist_match": artist_match,
-            "title_exact": title_exact,
-            "unrequested_qualifier": qualifier,
-            "score": score,
-        })
-    candidates.sort(key=lambda c: (c["artist_match"], c["score"]), reverse=True)
-
-    best = candidates[0] if candidates else None
-    confident = bool(
-        best and best["artist_match"] and best["title_exact"]
-        and not best["unrequested_qualifier"]
-    )
-    emit({
-        "ok": True,
-        "artist": artist,
-        "title": title,
-        "confident": confident,
-        "best": best,
-        "candidates": candidates,
-    })
+    _legacy(call("resolve", {"artist": artist, "title": title, "limit": limit}),
+            lambda r: {"artist": artist, "title": title, "confident": r.get("confident", False),
+                       "best": _flat(r.get("best")),
+                       "candidates": [_flat(c) for c in r.get("candidates") or []]})
 
 
 def playlist_list() -> None:
-    session = _session()
-    playlists = _api_call(session.user.playlists)
-    emit({"ok": True, "playlists": [_playlist_json(p) for p in playlists]})
+    _legacy(call("library.playlists", {}), lambda r: r)
 
 
 def playlist_show(playlist_id: str) -> None:
-    session = _session()
-    pl = _api_call(session.playlist, playlist_id)
-    tracks = _api_call(pl.tracks)
-    payload = _playlist_json(pl)
-    emit({"ok": True, "playlist": payload,
-          "tracks": [_track_json(t) for t in tracks]})
+    _legacy(_call_named("playlist.tracks", {"id": playlist_id}),
+            lambda r: {"playlist": r.get("playlist"), "tracks": r.get("tracks", [])})
 
 
-def playlist_create(name: str, description: str) -> None:
-    session = _session()
-    pl = _api_call(session.user.create_playlist, name, description or "")
-    emit({"ok": True, "playlist": _playlist_json(pl)})
+def playlist_create(name: str, description: str, track_ids: tuple = ()) -> None:
+    args = {"name": name, "description": description}
+    if track_ids:
+        args["track_ids"] = [str(t) for t in track_ids]
+    cmd, args, refused = with_ids("playlist.create", args)
+    _legacy(refused if refused is not None else call(cmd, args),
+            lambda r: {"playlist": r.get("playlist"),
+                       **({"added": r["added"]} if "added" in r else {})})
 
 
 def playlist_add(playlist_id: str, track_ids: tuple) -> None:
-    """Two requests (fetch the playlist, add the tracks). The server skips
-    duplicates; `added` reports what it actually took."""
-    session = _session()
-    pl = _api_call(session.playlist, playlist_id)
-    added = _api_call(pl.add, [str(t) for t in track_ids])
-    emit({"ok": True, "playlist_id": str(playlist_id),
-          "requested": len(track_ids),
-          "added": len(added) if added is not None else 0})
+    """Queued: answered at once; `added` is gone because it is not known yet."""
+    cmd, args, refused = with_ids("playlist.add", {"id": playlist_id,
+                                                   "track_ids": [str(t) for t in track_ids]})
+    _legacy(refused if refused is not None else call(cmd, args),
+            lambda r: {"playlist_id": str(args["id"]), "requested": len(args["track_ids"]), **r})
 
 
 def unblock() -> None:
-    """The human's lever, not the agent's: clear a tripped stop."""
+    """The human's lever, not the agent's: clear a tripped stop (ADR-0001)."""
+    from ticli import commands
+
+    if commands.cli_caller() != commands.HUMAN:
+        raise fail(
+            "human_only", "Only a human at a terminal can clear the trip.",
+            hint=("Stop and ask your human to run `ticli agent unblock` in a "
+                  "terminal after checking why TIDAL blocked us."))
     was = throttle.unblock()
     emit({"ok": True, "was_tripped": was})
     if not was:
