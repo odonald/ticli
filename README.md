@@ -53,6 +53,32 @@ ticli
 
 On first run you'll get a URL to authorize with your TIDAL account. After that, your session is cached and you go straight to the player.
 
+## From the command line
+
+Verbs that talk to the running player, one line of output each (`ticli --help` lists them all):
+
+```bash
+ticli status | pause | resume | next | prev          # "nothing playing" if no player is running; only resume starts one, for the saved track
+ticli play                                           # bare: the same as resume ("nothing to play" if nothing was playing)
+ticli start playlist edm                             # play it, then open the TUI here (--no-tui: just play)
+ticli start                                          # bare: resume what was playing, then open the TUI
+ticli queue "marc rebillet - reach out" --next       # add after the current track (default: the end); never starts playback
+ticli playlist create "Road trip"
+ticli playlist add "Road trip" "daft punk - one more time"
+ticli like                                           # the playing track
+ticli download https://tidal.com/browse/track/123
+ticli download album "discovery" tier=MAX           # a whole album or playlist, like the TUI's D
+ticli queue move 4 1                                 # indexes as `ticli queue` lists them; `ticli queue clear` keeps only the current track
+ticli cache status                                   # cached songs vs the budget, downloads, metadata
+ticli track info current                             # album, quality, liked, downloaded or cached
+ticli playlist rename "Road trip" "Road trip 2026"   # also: playlist describe, playlist delete (y/N)
+ticli restart                                        # the background player on the current code; playback resumes where it was
+```
+
+After an update, the background player may still run the old code. A verb finding an older player that is idle or only playing replaces it on its own (one line on stderr, about a second of silence); while a download runs it leaves it and says to run `ticli restart`.
+
+Playlist names match your own playlists case-insensitively with no TIDAL request, otherwise one TIDAL search; several matches print a numbered top 5 (`ticli start playlist 2` picks). A song is a track id, a TIDAL URL, `"artist - title"` (added only when the match is confident, otherwise you get candidates) or `current`. Dangerous verbs (deleting or renaming playlists, re-fetching the library, clearing the cache, logout) ask y/N; `ticli refetch` first shows what it would upgrade. Run without a terminal, a verb is treated as an AI agent and obeys the TUI's AI-control switches.
+
 ### Login, and where FLAC comes from
 
 Two sign-ins exist, and they are not equal:
@@ -131,7 +157,12 @@ ticli agent playlist create "Morning Uplift"
 ticli agent playlist add <playlist-id> <track-id>...
 ```
 
-Two things make it safe to point an agent at:
+Three things make it safe to point an agent at:
+
+- **You hold the switches.** The settings page (`c`) has "Allow AI control"
+  (on), "Allow dangerous commands" (off) and an optional "AI control key"
+  that agents must pass as `TICLI_AI_KEY`. Only a keypress in the TUI
+  changes them, and every refusal tells the agent to ask you.
 
 - **Rate limiting is enforced, not suggested.** Every request goes through a
   cross-process throttle (2 seconds apart, however many agents are running).
@@ -158,27 +189,16 @@ Ticli uses [tidalapi](https://github.com/tamland/python-tidal) to authenticate (
 └─────────┘    metadata     └───────────┘                  └───────────┘
 ```
 
-## Contributing, and a note for AI agents
+## Contributing
 
-**Start with [`ai/README.md`](ai/README.md).** Much of this project was built
-with AI assistance, and `ai/` is where the reasoning lives: the constraints that
-are load-bearing, what was measured, what was tried and rejected, and the
-incidents that produced the rules. It is short, and reading it first will save
-you from re-deriving things the hard way — several of its rules exist because
-violating them broke something real.
+The code is the documentation. [`CLAUDE.md`](CLAUDE.md) maps the codebase and
+lists the few rules that prevent real damage, [`GLOSSARY.md`](GLOSSARY.md)
+defines the project's terms, and [`docs/adr/`](docs/adr/) records the
+decisions the code can't explain on its own.
 
-Two constraints are worth knowing before you touch anything:
-
-- **Be frugal with TIDAL's API.** Rate-limiting an account is easy to do by
-  accident and it stops the owner's music. `ai/WORKING-RULES.md` has the
-  specifics.
-- **Tests assert observable reality** — bytes on disk, escape sequences on the
-  terminal, request counts — not internal bookkeeping. A feature here once
-  passed its whole suite for two days without writing a single byte.
-
-If you are an AI agent working on this repository, **updating `ai/` is part of
-the work, in the same commit as the code.** `ai/README.md` says what belongs
-where.
+One constraint is worth knowing before you touch anything: **be frugal with
+TIDAL's API.** Rate-limiting an account is easy to do by accident and it stops
+the owner's music ([ADR-0001](docs/adr/0001-tidal-rate-limits.md)).
 
 ## Requirements
 
