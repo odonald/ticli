@@ -1,7 +1,8 @@
 """Tests for the download tier.
 
-The rule these are written to (ai/WORKING-RULES.md, and INCIDENTS #2 behind
-it) is that a test asserts observable reality. A download is bytes in the
+The rule these are written to is that a test asserts observable reality,
+because tests that asserted bookkeeping once stayed green over a cache that
+had never written a byte. A download is bytes in the
 user's music folder, so that is what is asserted: the file exists, its bytes
 equal the bytes the server sent, its header is the container its extension
 claims, and the tags read back out of it. Two of the cases run over a real
@@ -236,7 +237,8 @@ class TestEstimatesCostNothing:
 
     def test_opening_the_box_and_walking_every_tier_costs_no_request(self, monkeypatch):
         """Four tiers hovered is four numbers shown and **zero** calls. One
-        `playbackinfo` per hover is what ai/INCIDENTS #1 was, so this is the
+        `playbackinfo` per hover is what got the IP blocked (docs/adr/0001),
+        so this is the
         assertion the estimates exist for."""
         patch_get(monkeypatch, player_mod,
                   lambda *a, **k: pytest.fail("no requests here"))
@@ -272,7 +274,7 @@ class TestTheSizeIsExactWhenItIsFree:
     """A `~` means an estimate and no `~` means a byte count. The only two
     places a real one can be had for nothing are the download index and the
     cache tracker — anywhere else it is a request, and a request per hover is
-    ai/INCIDENTS #1."""
+    docs/adr/0001-tidal-rate-limits.md."""
 
     def _opened(self, quality="HIGH"):
         p = _player(quality=quality)
@@ -379,7 +381,7 @@ class TestTheKeyIsFree:
                      "_handle_artist_key", "_handle_queue_key"):
             source = inspect.getsource(getattr(p, name))
             assert source.count('== "d"') == 1, f"{name} should open downloads"
-        # Search types every printable key, so `d` must never be a command there
+        # The search bar types every printable key; `d` is a command only with the results selected
         search = inspect.getsource(p._handle_search_key)
         assert '"d"' not in search
 
@@ -542,7 +544,8 @@ class TestATierThatCannotBeServedStepsDown:
 
     def test_a_rate_limit_is_never_stepped_past(self):
         """Retrying is what turned a rate limit into an edge block
-        (ai/INCIDENTS #1). Three more requests at lower tiers is the worst
+        (docs/adr/0001-tidal-rate-limits.md). Three more requests at lower tiers is
+        the worst
         possible response to a limiter already saying no."""
         p = _player(quality="MAX")
         asked = []
@@ -602,7 +605,7 @@ class TestASegmentedDownload:
                     is_bts=False, dash_info=None))
             p._download_track = track
             # the manifest is already written; the tier is what a stream says
-            p._stream_description = lambda t: (path, "LOSSLESS")
+            p._stream_description = lambda t, quality=None: (path, "LOSSLESS")
 
             job = _download(p, "HIGH")
             assert job["state"] == "done", job.get("error")
@@ -1531,7 +1534,8 @@ class TestTheTwoTiersReadAsTwoTiers:
 class TestReFetchingEverything:
     """The one action in the app that deliberately makes hundreds of requests.
 
-    ai/INCIDENTS #1 is 53 `playbackinfo` calls in 2.8 s getting the owner's IP
+    docs/adr/0001-tidal-rate-limits.md: 53 `playbackinfo` calls in 2.8 s getting
+    the owner's IP
     blocked and his music stopping. So the tests here are about the brakes:
     that it asks first, that it is serial and paced, that it can be stopped,
     and that evidence of a block ends it rather than being retried.
@@ -2296,8 +2300,7 @@ class TestSeeingAndRemovingWhatYouHave:
     # ── what it costs ──
 
     def test_painting_two_hundred_marked_rows_costs_one_index_read(self, monkeypatch):
-        """Finding F6 of ai/reference/data-path-audit-2026-07-26.md, which is
-        what a `path_for` per row would be: 229 ms of UI-thread JSON at 500
+        """A `path_for` per row would be 229 ms of UI-thread JSON at 500
         entries, twice a second. Assert the reads, not the milliseconds."""
         for tid in range(200):
             self._download(tid, name=f"Song {tid}")
@@ -2341,7 +2344,8 @@ class TestSeeingAndRemovingWhatYouHave:
         assert len(reads) == 1
 
     def test_the_list_and_the_markers_make_no_request_at_all(self, monkeypatch):
-        """ai/INCIDENTS #1. Nothing on this screen needs the network: every
+        """docs/adr/0001-tidal-rate-limits.md. Nothing on this screen needs the
+        network: every
         field comes off the path the downloader wrote or the index row beside
         it, which is why there is no [Enter] to play a row."""
         def _refuse(*a, **k):
@@ -2571,3 +2575,181 @@ class TestIndexWritesAreSerialized:
             "a writer reached _save_index without holding _index_lock"
         assert self._rows_on_disk() == {}
         assert not path.exists()
+
+
+class _TidalSession:
+    """tidalapi's shape: `audio_quality` is a setter over `config.quality`,
+    which `Track.get_stream` reads when it builds the request."""
+
+    def __init__(self, quality):
+        self.config = types.SimpleNamespace(quality=quality)
+        self.is_pkce = False
+
+    @property
+    def audio_quality(self):
+        return self.config.quality
+
+    @audio_quality.setter
+    def audio_quality(self, quality):
+        self.config.quality = quality
+
+
+class _ArrivalLock:
+    """A lock that announces every thread that comes to take it, so a test
+    can tell "blocked on the lock" apart from "never asked"."""
+
+    def __init__(self, arrived):
+        self._lock = threading.Lock()
+        self._arrived = arrived
+
+    def __enter__(self):
+        if self._lock.locked():
+            self._arrived.set()
+        self._lock.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self._lock.release()
+
+
+class TestADownloadDoesNotLeakItsTierIntoTheSession:
+    """tidalapi has one quality per session, so a download asks for its tier
+    by setting it for the length of one request. Nothing else may see it."""
+
+    def _blocked_download(self, p, tier):
+        in_fetch, release = threading.Event(), threading.Event()
+        track = _track(tid=1)
+
+        def _stream():
+            asked = p.session.config.quality
+            in_fetch.set()
+            assert release.wait(5), "the test never let the download finish"
+            return types.SimpleNamespace(
+                audio_quality=asked,
+                get_stream_manifest=lambda: types.SimpleNamespace(
+                    is_bts=True, get_urls=lambda: ["http://127.0.0.1/1.mp4"]))
+
+        track.get_stream = _stream
+        worker = threading.Thread(
+            target=lambda: p._download_stream_url(track, tier), daemon=True)
+        worker.start()
+        assert in_fetch.wait(5), "the download never reached its request"
+        return worker, release
+
+    def _player(self):
+        p = _player(quality="MAX")
+        p.session = _TidalSession(HeadlessTidalPlayer.QUALITY_MAP["MAX"])
+        return p
+
+    def test_a_track_starting_mid_download_gets_the_playback_tier(self):
+        p = self._player()
+        moved_on = threading.Event()
+        p._quality_lock = _ArrivalLock(moved_on)
+        worker, release = self._blocked_download(p, "LOW")
+
+        asked = []
+        track = _track(tid=2)
+
+        def _stream():
+            asked.append(p.session.config.quality)
+            moved_on.set()
+            return types.SimpleNamespace(
+                audio_quality=asked[-1],
+                get_stream_manifest=lambda: types.SimpleNamespace(
+                    is_bts=True, get_urls=lambda: ["http://127.0.0.1/2.mp4"]))
+
+        track.get_stream = _stream
+        playback = threading.Thread(target=lambda: p._stream_url(track), daemon=True)
+        playback.start()
+        assert moved_on.wait(5)
+        release.set()
+        worker.join(5)
+        playback.join(5)
+        assert not worker.is_alive() and not playback.is_alive()
+        assert asked == [HeadlessTidalPlayer.QUALITY_MAP["MAX"]], \
+            "a track played during a download was requested at the download's tier"
+
+    def _playback_asks(self, p):
+        asked = []
+        track = _track(tid=3)
+
+        def _stream():
+            asked.append(p.session.config.quality)
+            return types.SimpleNamespace(
+                audio_quality=asked[-1],
+                get_stream_manifest=lambda: types.SimpleNamespace(
+                    is_bts=True, get_urls=lambda: ["http://127.0.0.1/3.mp4"]))
+
+        track.get_stream = _stream
+        p._stream_url(track)
+        return asked
+
+    def test_a_quality_change_mid_download_is_honoured_afterwards(self):
+        p = self._player()
+        worker, release = self._blocked_download(p, "LOW")
+        p._apply_setting("quality", "MEDIUM")
+        release.set()
+        worker.join(5)
+        assert not worker.is_alive()
+        assert self._playback_asks(p) == [HeadlessTidalPlayer.QUALITY_MAP["MEDIUM"]], \
+            "the download put back the quality it found and undid the user's change"
+
+    def test_changing_quality_never_waits_on_a_download(self):
+        """The settings page runs on the UI thread, and tidalapi sets no
+        request timeout, so a hung download request must not freeze the TUI."""
+        p = self._player()
+        worker, release = self._blocked_download(p, "LOW")
+        changed = threading.Event()
+
+        def _change():
+            p._apply_setting("quality", "MEDIUM")
+            changed.set()
+
+        threading.Thread(target=_change, daemon=True).start()
+        try:
+            assert changed.wait(5), "changing quality waited on a download's request"
+        finally:
+            release.set()
+            worker.join(5)
+        assert not worker.is_alive()
+
+
+class TestAQualityCeilingComesFromWhatWasAskedFor:
+    """`_quality_ceiling` greys out tiers the login cannot have. Only a
+    request granted less than it asked for is evidence of that."""
+
+    def _track_granting(self, p, granted=None):
+        track = _track(tid=5)
+        track.get_stream = lambda: types.SimpleNamespace(
+            audio_quality=granted or str(p.session.config.quality),
+            get_stream_manifest=lambda: types.SimpleNamespace(
+                is_bts=True, get_urls=lambda: ["http://127.0.0.1/5.mp4"]))
+        return track
+
+    def _player(self):
+        p = _player(quality="MAX")
+        p.session = _TidalSession(HeadlessTidalPlayer.QUALITY_MAP["MAX"])
+        return p
+
+    def test_a_low_download_granted_low_sets_no_ceiling(self):
+        p = self._player()
+        p._download_stream_url(self._track_granting(p), "LOW")
+        assert p._quality_ceiling is None, \
+            "a LOW download greyed out the tiers above it"
+
+    def test_a_stepped_down_download_says_nothing_about_the_tier_above(self):
+        p = self._player()
+        p._download_stream_url(self._track_granting(p), "HIGH")
+        assert p._quality_ceiling is None
+        assert p._quality_unavailable("MAX") is False
+
+    def test_a_max_request_granted_lossless_still_sets_one(self):
+        p = self._player()
+        p._stream_url(self._track_granting(p, "LOSSLESS"))
+        assert p._quality_ceiling == "LOSSLESS"
+        assert p._quality_unavailable("MAX") is True
+
+    def test_a_download_granted_less_than_it_asked_for_sets_one(self):
+        p = self._player()
+        p._download_stream_url(self._track_granting(p, "LOW"), "HIGH")
+        assert p._quality_ceiling == "LOW"

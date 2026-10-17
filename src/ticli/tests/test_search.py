@@ -618,6 +618,7 @@ def _paged(filter_name="tracks", page_size=10, totals=None):
 
 
 def _scroll_to_bottom(p):
+    p._handle_search_key(player_mod.KEY_DOWN)  # out of the search bar, onto the first row
     for _ in range(len(p._search_results) + 1):
         p._handle_search_key(player_mod.KEY_DOWN)
 
@@ -642,7 +643,7 @@ class TestFetchMoreOnScroll:
 
     def test_cursor_stays_put_across_the_append(self, config_file):
         p = _paged(page_size=10)
-        for _ in range(9):
+        for _ in range(10):  # the first press leaves the search bar
             p._handle_search_key(player_mod.KEY_DOWN)
         assert p._search_cursor == 9  # the last row
         p._search_last_fetch = 0
@@ -926,8 +927,8 @@ class TestCommunityPlaylistScope:
         assert "Playlists" in text and "My Playlists" in text
         assert text.count("Playlists") == 2  # two rows, two different things
         labels = list(HeadlessTidalPlayer.SEARCH_FILTER_LABELS.values())
-        assert labels[-1] == "My Playlists"      # the local one stays last
-        assert labels[-2] == "Playlists"         # the new one joins the network scopes
+        assert labels[-2:] == ["My Playlists", "My Music"]  # the local ones stay last
+        assert labels[-3] == "Playlists"         # the new one joins the network scopes
 
     def test_tab_reaches_it_before_my_playlists(self, config_file):
         p, _ = _search(page_size=10)

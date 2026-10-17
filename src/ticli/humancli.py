@@ -1,0 +1,937 @@
+"""`ticli <verb>`: the human CLI, a client of the background player (ADR-0008).
+
+Every verb is one command from `ticli.commands`, sent over the socket. Caller
+is decided by `commands.cli_caller()` (ADR-0007): a terminal on stdin is the
+human, anything else is an agent that the switches and the key gate, through
+the same paced path as `ticli agent`. Output is one readable line per result.
+
+Arguments take names and `<song>` forms (id, TIDAL URL, "artist - title",
+`current`); they are resolved here, before the command is sent. Must not
+import `ticli.player` at module level: `ticli --help` stays instant.
+"""
+
+import json
+import re
+import shlex
+import time
+from urllib.parse import urlsplit
+
+import click
+
+from ticli.utils import throttle
+
+HUMAN, AGENT = "human", "agent"
+TOP = 5
+TRANSPORT = {"pause": "paused", "resume": "resumed", "next": "next track", "prev": "previous track"}
+DONE = {**TRANSPORT, "like": "liked", "unlike": "unliked", "stop": "stopped",
+        "playlist.create": "playlist created", "playlist.add": "added to the playlist",
+        "playlist.remove": "removed from the playlist", "download": "downloading",
+        "download.cancel": "download cancelled", "download.delete": "download deleted",
+        "queue.remove": "removed from the queue", "queue.play": "playing from the queue",
+        "seek": "seeked", "logout": "logged out", "cache.clear": "cache cleared",
+        "playlist.rename": "playlist renamed", "playlist.describe": "description changed",
+        **{f"{v}.{k}": f"{'added to' if v == 'favorite' else 'removed from'} favorites"
+           for v in ("favorite", "unfavorite") for k in ("album", "artist", "playlist")}}
+# Commands whose `id` argument is a name for this kind of thing.
+NAMED = {"playlist.add": "playlist", "playlist.remove": "playlist", "playlist.tracks": "playlist",
+         "playlist.move": "playlist",
+         "play.playlist": "playlist", "play.album": "album", "album.tracks": "album",
+         "play.artist": "artist", "artist.section": "artist",
+         "playlist.delete": "playlist", "playlist.rename": "playlist", "playlist.describe": "playlist",
+         "download.album": "album", "download.playlist": "playlist",
+         "favorite.album": "album", "unfavorite.album": "album", "favorite.artist": "artist",
+         "unfavorite.artist": "artist", "favorite.playlist": "playlist",
+         "unfavorite.playlist": "playlist"}
+ID_FORM = {"playlist": re.compile(r"[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}"),
+           "album": re.compile(r"\d{5,}"), "artist": re.compile(r"\d{5,}")}
+PICK = re.compile(r"[1-9]\d?")
+PICK_TTL_SECONDS = 600
+PAGE = 100
+CONFIRM_ABOVE = 200
+# How long a human verb waits: for a start, for a reply (a TIDAL read may queue), and
+# for a transport verb's reply, which the player gives before any stream is fetched.
+START_SECONDS = 30.0
+REPLY_SECONDS = 60.0
+TRANSPORT_REPLY_SECONDS = 5.0
+URL = re.compile(r"(?:^|/)(track|album|playlist)/([0-9A-Za-z-]+)")
+
+
+def _is_tidal_url(text: str) -> bool:
+    """A URL whose host is tidal.com or a subdomain; the scheme may be left off."""
+    raw = str(text).strip()
+    try:
+        host = urlsplit(raw if "://" in raw else "https://" + raw).hostname or ""
+    except ValueError:
+        return False
+    return host == "tidal.com" or host.endswith(".tidal.com")
+
+CURRENT_BY_DEFAULT = ("like", "unlike", "download")
+QUEUE_ENTRY = ("queue.play", "queue.remove", "queue.move")  # their track_id pins an entry; it is not a song
+SONG_FORMS = 'a track id, a TIDAL URL, "artist - title" or current'
+
+
+def caller() -> str:
+    from ticli import commands
+    return HUMAN if commands.cli_caller() == commands.HUMAN else AGENT
+
+
+class Stop(Exception):
+    def __init__(self, reply: dict):
+        super().__init__(reply.get("reason"))
+        self.reply = reply
+
+
+def refusal(code: str, reason: str, fix: str = "", **extra) -> dict:
+    return {"ok": False, "code": code, "reason": reason, **({"fix": fix} if fix else {}), **extra}
+
+
+def _note(text: str) -> None:
+    click.echo(text, err=True)
+
+
+class Link:
+    """One connection to the player, kept for a whole verb so it cannot leave between
+    the lookup and the action. Agents go through `ticli.agent.call` instead."""
+
+    def __init__(self, who: str, picks: bool = True):
+        self.who = who
+        self.picks = picks  # `ticli agent` takes ids or names, never a number from an earlier list
+        self.conn = None
+        self.labels: dict = {}  # arg -> the name it was resolved from, for a y/N prompt
+
+    def running(self) -> bool:
+        from ticli import ipc
+        if self.conn is not None:
+            return True
+        probe = ipc.connect()
+        if probe is None:
+            return False
+        probe.close()
+        return True
+
+    def ask(self, cmd: str, args=None, timeout: float = REPLY_SECONDS) -> dict:
+        args = args or {}
+        if self.who == AGENT:
+            from ticli import agent
+            return agent.call(cmd, args)
+        from ticli import ipc
+        from ticli.agentq import render
+        if self.conn is None:
+            self.conn, _ = ipc.connect_current(start=False, say=_note)
+        if self.conn is None:
+            failed = self._start()
+            if failed:
+                return failed
+        response = self.conn.request(cmd, args, caller="human", timeout=timeout)
+        if response is None:
+            closed = self.conn.closed
+            self.close()
+            if closed:
+                return refusal("player_gone", "The player closed the connection.",
+                               "Run `ticli status`; the action may still have run.")
+            return refusal("player_slow", f"The player has not answered in {timeout:g} s.",
+                           "It may still do it; run `ticli status` in a moment.")
+        response.pop("id", None)
+        if response.get("ok"):
+            response["result"] = render(response.get("result"))
+        elif self.conn.stale:
+            response = ipc.stale_reply(response, "ticli restart")
+        return response
+
+    def _start(self):
+        """Start the player, saying so first: signing in to TIDAL can take seconds, and
+        a silent wait reads as a hang. None once connected, else the refusal."""
+        from ticli import agent, ipc
+        click.echo("starting the player...", err=True)
+        self.conn, status = ipc.connect_current(timeout=START_SECONDS, say=_note)
+        if self.conn is not None:
+            return None
+        if status and "did not start in time" in status:
+            return refusal("player_slow", f"The player did not start within {START_SECONDS:g} s.",
+                           "It may still be signing in; run the command again in a moment.")
+        return agent._start_error(status)
+
+    def close(self) -> None:
+        if self.conn is not None:
+            self.conn.close()
+            self.conn = None
+
+
+# ── presenting ──
+
+
+def _mmss(seconds) -> str:
+    seconds = int(seconds or 0)
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+def _who(row: dict) -> str:
+    artists = row.get("artists") or ([row["artist"]] if row.get("artist") else [])
+    artists = [a.get("name") if isinstance(a, dict) else a for a in artists]
+    return ", ".join(a for a in artists if a)
+
+
+def _song(row: dict) -> str:
+    row = row.get("track") or row
+    text = f'{row.get("title") or row.get("name")}'
+    return f"{_who(row)} - {text}" if _who(row) else text
+
+
+def _named(row: dict) -> str:
+    detail = f' ({row["num_tracks"]} tracks)' if row.get("num_tracks") else ""
+    return f'{row.get("name") or _song(row)}{detail}'
+
+
+def _lines(rows, fmt) -> str:
+    return "\n".join(f'{row.get("id")}  {fmt(row)}' for row in rows) or "nothing found"
+
+
+def status_line(reply: dict) -> str:
+    from ticli.agentq import compact_state
+    state = reply.get("state") or compact_state(reply.get("result") or {})
+    track = state.get("track")
+    if not track:
+        return "nothing playing"
+    queue = state.get("queue") or {}
+    where = f' (queue {queue.get("index", 0) + 1}/{queue["len"]})' if queue.get("len") else ""
+    pending = f' | {state["pending"]} agent commands pending' if state.get("pending") else ""
+    modes = ((" | shuffle" if queue.get("shuffle") else "")
+             + (f' | repeat {queue["repeat"]}' if queue.get("repeat") else ""))
+    return (f'{"playing" if state.get("playing") else "paused"}: {track["artist"]} - {track["title"]} '
+            f'[{_mmss(track["pos"])}/{_mmss(track["dur"])}]{where}{modes}{pending}')
+
+
+def _search_lines(r: dict) -> str:
+    out = []
+    for kind, fmt in (("tracks", _song), ("albums", lambda a: f'{a.get("title")} - {_who(a)}'),
+                      ("artists", _named), ("playlists", _named)):
+        if r.get(kind):
+            out.append(f"{kind}:\n" + _lines(r[kind], fmt))
+    return "\n".join(out) or "nothing found"
+
+
+def _resolve_line(r: dict) -> str:
+    best = r.get("best")
+    if not best:
+        return "no match"
+    row = best.get("track") or best
+    return f'{"match" if r.get("confident") else "closest, not confident"}: {row.get("id")}  {_song(row)}'
+
+
+def _queued(reply: dict) -> str:
+    result, cost = reply.get("result") or {}, reply.get("cost") or {}
+    text = f'queued #{result["queued"]}, done in ~{cost.get("eta_s", 0):g} s'
+    return text + (f' ({result["merged"]})' if result.get("merged") else "")
+
+
+def line(cmd: str, reply: dict) -> str:
+    result = reply.get("result")
+    if isinstance(result, dict) and "queued" in result:
+        return _queued(reply)
+    text = _line(cmd, reply, result)
+    if isinstance(result, dict) and result.get("age"):
+        return f'offline, {result["age"]}\n{text}'
+    if isinstance(result, dict) and result.get("source") == "local" and result.get("offline"):
+        return f"offline: from your own music\n{text}"
+    return text
+
+
+def _line(cmd: str, reply: dict, result) -> str:
+    if cmd == "status":
+        return status_line(reply)
+    r = result if isinstance(result, dict) else {}
+    if cmd == "search":
+        return _search_lines(r)
+    if cmd == "resolve":
+        return _resolve_line(r)
+    if cmd == "library.playlists":
+        return _lines(r.get("playlists", []), _named)
+    if cmd == "library.favorites":
+        rows = next((r[k] for k in ("tracks", "albums", "artists") if k in r), [])
+        return _lines(rows, lambda o: _song(o) if "duration_seconds" in o else _named(o))
+    if cmd == "library.mixes":
+        return _lines(r.get("mixes", []), _named)
+    if cmd in ("playlist.tracks", "album.tracks", "mix.tracks"):
+        head = f'{_named(r["playlist"])}\n' if r.get("playlist") else ""
+        return head + _lines(r.get("tracks", []), _song)
+    if cmd == "queue.list":
+        return "\n".join(f'{"> " if i == r.get("index") else "  "}{i}  {_song(t)}'
+                         for i, t in enumerate(r.get("tracks", []))) or "the queue is empty"
+    if cmd == "download.list":
+        return _lines(r.get("downloads", []), lambda d: f'{d.get("artist")} - {d.get("title")}') \
+            if r.get("downloads") else "no downloads"
+    if cmd == "queue.add" and "queue_length" in r:
+        return _queue_added(r)
+    if cmd == "queue.move" and "index" in r:
+        return f'moved to #{r["index"] + 1} of {r.get("queue_length")}'
+    if cmd == "queue.clear" and "removed" in r:
+        return f'cleared {r["removed"]} track{"" if r["removed"] == 1 else "s"} from the queue'
+    if cmd == "shuffle" and "shuffle" in r:
+        return f'shuffle {"on" if r["shuffle"] else "off"}'
+    if cmd == "repeat" and "repeat" in r:
+        return f'repeat {r["repeat"]}'
+    if cmd == "playlist.move" and "index" in r:
+        return f'moving to #{r["index"] + 1}'
+    if cmd == "history.list":
+        return "\n".join(r.get("history") or []) or "no search history"
+    if cmd == "cache.status" and "songs" in r:
+        return _cache_lines(r)
+    if cmd == "track.info" and r.get("track"):
+        return _track_info_lines(r)
+    if cmd in ("refetch.plan", "refetch") and "songs" in r:
+        return _refetch_line(cmd, r)
+    if cmd == "playlist.delete" and r.get("name"):
+        return f'deleted playlist "{r["name"]}"' if r.get("deleted", True) else "not deleted"
+    if cmd in ("download.album", "download.playlist") and "tracks" in r:
+        return f'downloading {r["tracks"]} tracks of "{r.get("label")}" at {r.get("tier")}'
+    if cmd.startswith("play.") and "queue_length" in r:
+        return f'playing: queue of {r["queue_length"]}'
+    if cmd == "playlist.create" and isinstance(r.get("playlist"), dict):
+        return f'created {r["playlist"].get("id")}  {r["playlist"].get("name")}'
+    if cmd in DONE:
+        return DONE[cmd]
+    return json.dumps(result, separators=(",", ":")) if result else "done"
+
+
+def _size(num) -> str:
+    from ticli.utils.downloads import format_bytes
+    return format_bytes(int(num or 0)) if num else "0 B"
+
+
+def _cache_lines(r: dict) -> str:
+    songs, owned, meta = r.get("songs") or {}, r.get("downloads") or {}, r.get("metadata") or {}
+    return "\n".join([
+        f'cached songs: {songs.get("count", 0)}, {_size(songs.get("bytes"))} of '
+        f'{_size(songs.get("budget_bytes"))}' + ("" if songs.get("enabled", True) else " (caching off)"),
+        f'downloads: {owned.get("count", 0)}, {_size(owned.get("bytes"))}',
+        f'metadata: {_size(meta.get("bytes"))} of {_size(meta.get("cap_bytes"))}'
+        + ("" if meta.get("enabled", True) else " (off)")])
+
+
+def _track_info_lines(r: dict) -> str:
+    t = r["track"]
+    local = [f'{where} ({(r[where] or {}).get("tier") or "tier unknown"})'
+             for where in ("downloaded", "cached") if r.get(where)]
+    return "\n".join([
+        f'{t.get("id")}  {_song(t)} [{_mmss(t.get("duration_seconds"))}]',
+        f'album: {t.get("album") or "?"}' + (" | explicit" if t.get("explicit") else ""),
+        f'quality: {r.get("quality") or "unknown"} | {"liked" if r.get("liked") else "not liked"}'
+        f' | {", ".join(local) or "not on disk"}'])
+
+
+def _refetch_line(cmd: str, r: dict) -> str:
+    if not r["songs"]:
+        return r.get("note") or f'nothing below {r.get("tier")} to upgrade'
+    minutes = max(1, round(r.get("eta_s", 0) / 60))
+    what = (f'{r["songs"]} songs to {r.get("target")} ({r.get("downloads", 0)} downloads, '
+            f'{r.get("cached", 0)} cached, ~{_size(r.get("bytes"))}): {r.get("requests")} requests, '
+            f'at least {minutes} min')
+    if cmd == "refetch.plan":
+        return "would upgrade " + what
+    return ("re-fetching " if r.get("started") else "already re-fetching " if r.get("running")
+            else "not started: ") + what
+
+
+def _queue_added(r: dict) -> str:
+    tracks = r.get("tracks") or []
+    what = _song(tracks[0]) if r.get("added") == 1 and tracks else f'{r.get("added")} tracks'
+    where = "next" if r.get("position") == "next" else "at the end"
+    text = f'queued {what} {where} (#{r["index"] + 1} of {r["queue_length"]})'
+    return text + (f'\n{r["note"]}' if r.get("note") else "")
+
+
+def fail(reply: dict) -> "SystemExit":
+    click.echo(f'ticli: {reply.get("reason")} ({reply.get("code")})', err=True)
+    if reply.get("fix"):
+        click.echo(f'  {reply["fix"]}', err=True)
+    return SystemExit(1)
+
+
+def say(who: str, cmd: str, reply: dict) -> None:
+    if not reply.get("ok"):
+        if who == AGENT and reply.get("candidates"):
+            from ticli import agent
+            agent.emit(reply)
+            raise SystemExit(1)
+        raise fail(reply)
+    click.echo(line(cmd, reply))
+
+
+# ── permissions ──
+
+
+def guard(cmd: str, who: str, read: bool = False) -> None:
+    """A non-terminal caller is an agent: the switches and the key apply."""
+    if who != AGENT:
+        return
+    from ticli import agent
+    from ticli.commands import AGENT as AGENT_CALLER
+    from ticli.commands import gate
+    from ticli.utils.config import load_config
+    refused = gate(cmd, AGENT_CALLER, agent._key(), load_config(), read=read)
+    if refused:
+        raise Stop(refused)
+
+
+def confirmed(cmd: str, args: dict, labels=None) -> bool:
+    """Dangerous verbs ask the human, default no (ADR-0007)."""
+    from types import SimpleNamespace
+
+    from ticli.commands import COMMANDS
+    from ticli.utils.config import load_config
+    spec = COMMANDS[cmd]
+    try:
+        dangerous = spec.is_dangerous(SimpleNamespace(config=load_config()), args)
+    except Exception:
+        dangerous = True
+    if not dangerous:
+        return True
+    labels = labels or {}
+    shown = " ".join(f'"{labels[k]}" ({v})' if labels.get(k) not in (None, str(v)) else str(v)
+                     for k, v in args.items())
+    return click.confirm(f'"{cmd.replace(".", " ")} {shown}" is dangerous. Continue?', default=False)
+
+
+# ── names ──
+
+
+def _picks_file():
+    return throttle.STATE_DIR / "picks.json"
+
+
+def _load_picks() -> dict:
+    try:
+        saved = json.loads(_picks_file().read_text())
+    except (OSError, ValueError):
+        return {}
+    return saved if isinstance(saved, dict) else {}
+
+
+def _save_picks(who: str, kind: str, rows: list) -> None:
+    """Per caller, so a script's ambiguity never renumbers the list the human is reading."""
+    try:
+        throttle.STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+        saved = _load_picks()
+        saved[who] = {"kind": kind, "rows": rows, "at": time.time()}
+        _picks_file().write_text(json.dumps(saved))
+    except OSError:
+        pass
+
+
+def _take_pick(who: str, kind: str, text: str):
+    if not PICK.fullmatch(text):
+        return None
+    saved = _load_picks().get(who)
+    if not isinstance(saved, dict) or time.time() - (saved.get("at") or 0) > PICK_TTL_SECONDS:
+        return None
+    rows = saved.get("rows") or []
+    if saved.get("kind") != kind or not 1 <= int(text) <= len(rows):
+        return None
+    return rows[int(text) - 1]
+
+
+def _row(kind: str, obj: dict) -> dict:
+    name = obj.get("name") or f'{obj.get("title")} - {_who(obj)}'
+    return {"id": str(obj.get("id")), "name": name, **(
+        {"num_tracks": obj["num_tracks"]} if obj.get("num_tracks") else {})}
+
+
+def _ambiguous(link: Link, kind: str, text: str, rows: list, example: str) -> Stop:
+    rows = rows[:TOP]
+    if link.picks:
+        _save_picks(link.who, kind, rows)
+    if link.who == AGENT:
+        return Stop(refusal("ambiguous", f'"{text}" matches several {kind}s.',
+                            "Pick one and run the command again with its id instead of the name.",
+                            candidates=rows))
+    shown = "\n".join(f'  {i}. {_named(r)}' for i, r in enumerate(rows, 1))
+    return Stop(refusal("ambiguous", f'"{text}" matches several {kind}s:\n{shown}',
+                        f"Run `{example}` to pick (the number, or the id)."))
+
+
+def _local_favorites(who: str, kind: str) -> list:
+    guard("library.favorites", who, read=True)
+    from ticli.utils.cache import MetadataCache
+    return [{"id": str(o.id), "name": o.name}
+            for o in MetadataCache().get_items(f"favorites:{kind}s") or []]
+
+
+def _local_playlists(who: str) -> list:
+    guard("library.playlists", who, read=True)
+    from ticli.utils.cache import MetadataCache
+    return [{"id": str(p.id), "name": p.name, "num_tracks": p.num_tracks}
+            for p in MetadataCache().get_playlists() or []]
+
+
+def resolve_name(link: Link, kind: str, token, example: str) -> tuple:
+    """(id, label). Own playlists in the local index first (0 requests); else one
+    TIDAL search. Several equally good matches stop with a numbered top 5."""
+    text = str(token).strip()
+    if ID_FORM[kind].fullmatch(text):
+        return text, text
+    wanted = text.casefold()
+    own = _local_playlists(link.who) if kind == "playlist" else _local_favorites(link.who, kind)
+    exact = [p for p in own if p["name"].casefold() == wanted]
+    if len(exact) == 1:
+        return exact[0]["id"], exact[0]["name"]
+    picked = _take_pick(link.who, kind, text) if link.picks else None
+    if picked:
+        return picked["id"], picked["name"]
+    # Favourites match by exact name only; a loose hit there must not hide TIDAL's answer.
+    loose = exact or ([p for p in own if wanted in p["name"].casefold()] if kind == "playlist" else [])
+    if len(loose) == 1:
+        return loose[0]["id"], loose[0]["name"]
+    if loose:
+        raise _ambiguous(link, kind, text, loose, example)
+    if link.who == AGENT and not _ai_control():
+        raise Stop(refusal("not_found", f'None of your playlists matches "{text}".',
+                           "AI control is off, so TIDAL was not searched; pass an id."))
+    reply = link.ask("search", {"query": text, "types": [kind], "limit": TOP})
+    if not reply.get("ok"):
+        raise Stop(reply)
+    rows = [_row(kind, o) for o in (reply["result"] or {}).get(kind + "s", [])]
+    exact = [r for r in rows if r["name"].casefold() == wanted]
+    if len(exact) == 1 or len(rows) == 1:
+        found = (exact or rows)[0]
+        return found["id"], found["name"]
+    if not rows:
+        raise Stop(refusal("not_found", f'No {kind} matches "{text}".',
+                           f"Try `ticli search {text}` or pass an id."))
+    raise _ambiguous(link, kind, text, exact or rows, example)
+
+
+def _ai_control() -> bool:
+    from ticli.utils.config import load_config
+    return bool(load_config().get("allow_ai_control", True))
+
+
+# ── songs ──
+
+
+def _current(link: Link) -> str:
+    if not link.running():
+        raise Stop(refusal("no_track", "Nothing is playing.", "Pass a track id or another form."))
+    reply = link.ask("status")
+    track = ((reply.get("state") or {}).get("track")
+             or ((reply.get("result") or {}).get("track")))
+    if not reply.get("ok") or not track:
+        raise Stop(reply if not reply.get("ok") else refusal(
+            "no_track", "Nothing is playing.", "Pass a track id or another form."))
+    return str(track["id"])
+
+
+def _song_candidates(r: dict, token: str) -> Stop:
+    rows = [{"id": str((c.get("track") or c).get("id")), "name": _song(c)}
+            for c in r.get("candidates") or []][:TOP]
+    if not rows:
+        return Stop(refusal("not_found", f'No song matches "{token}".', "Try `ticli search`."))
+    shown = "\n".join(f'  {r["id"]}  {r["name"]}' for r in rows)
+    return Stop(refusal("not_confident", f'No confident match for "{token}":\n{shown}',
+                        "Run the command again with the id of the one you want.", candidates=rows))
+
+
+def resolve_song(link: Link, token) -> list:
+    """Track ids for one `<song>` argument; an album or playlist URL is all its tracks."""
+    text = str(token).strip()
+    if text.isdigit():
+        return [text]
+    if text.lower() == "current":
+        return [_current(link)]
+    if _is_tidal_url(text):
+        found = URL.findall(text)
+        if not found:
+            raise Stop(refusal("bad_args", f"Not a TIDAL track, album or playlist URL: {text}",
+                               f"Use {SONG_FORMS}."))
+        kind, ident = found[-1]
+        if kind == "track":
+            return [ident]
+        return _all_tracks(link, kind, ident)
+    artist, sep, title = text.partition(" - ")
+    if not sep or not artist.strip() or not title.strip():
+        raise Stop(refusal("bad_args", f"Not a song: {text!r}.", f"Use {SONG_FORMS}."))
+    liked = _favorite_song(link.who, artist.strip(), title.strip())
+    if liked:
+        return [liked]
+    reply = link.ask("resolve", {"artist": artist.strip(), "title": title.strip(), "limit": 10})
+    if not reply.get("ok"):
+        raise Stop(reply)
+    result = reply["result"]
+    best = result.get("best")
+    if result.get("confident") and best:
+        return [str((best.get("track") or best)["id"])]
+    raise _song_candidates(result, text)
+
+
+def _favorite_song(who: str, artist: str, title: str):
+    """A favourite with exactly this artist and title, from the local cache (0 requests)."""
+    guard("library.favorites", who, read=True)
+    from ticli.commands import rank_tracks
+    from ticli.utils.cache import MetadataCache
+    ranked = rank_tracks(MetadataCache().get_items("favorites:tracks") or [], artist, title)
+    return str(ranked["best"]["track"].id) if ranked["confident"] else None
+
+
+def _all_tracks(link: Link, kind: str, ident: str) -> list:
+    """Every track of an album or playlist, a page at a time."""
+    ids, total = [], None
+    while True:
+        reply = link.ask(f"{kind}.tracks", {"id": ident, "offset": len(ids), "limit": PAGE})
+        if not reply.get("ok"):
+            raise Stop(reply)
+        page = reply["result"].get("tracks", [])
+        total = reply["result"].get("num_tracks") or total
+        ids += [str(t["id"]) for t in page]
+        if not page or not total or len(ids) >= total:
+            break
+    if total and len(ids) < total:
+        click.echo(f"note: got {len(ids)} of {total} tracks of that {kind}", err=True)
+    if link.who == HUMAN and len(ids) > CONFIRM_ABOVE and not click.confirm(
+            f"That {kind} is {len(ids)} tracks. Use them all?", default=False):
+        raise Stop(refusal("cancelled", "cancelled"))
+    return ids
+
+
+# ── running a verb ──
+
+
+def _queue_guard(link: Link, args: dict) -> dict:
+    """Pin the entry by its track so a queue another client moved is `stale`, not another track."""
+    reply = link.ask("queue.list")
+    tracks = ((reply.get("result") or {}).get("tracks") or []) if reply.get("ok") else []
+    index = args.get("index")
+    if isinstance(index, int) and not isinstance(index, bool) and 0 <= index < len(tracks):
+        return {"track_id": tracks[index].get("id")}
+    return {}
+
+
+def prepare(link: Link, cmd: str, args: dict) -> tuple:
+    """(command, args) with names and songs turned into ids."""
+    from ticli.commands import COMMANDS
+    args = dict(args)
+    songs = args.get("track_ids") if isinstance(args.get("track_ids"), list) else []
+    example = " ".join(["ticli", cmd.replace(".", " "), "2", *(shlex.quote(str(t)) for t in songs)])
+    kind = NAMED.get(cmd)
+    if cmd == "playlist.delete" and link.who == AGENT and not ID_FORM["playlist"].fullmatch(
+            str(args.get("id", "")).strip()):
+        raise Stop(refusal("bad_args", "playlist delete takes a playlist id, never a name.",
+                           "Get the id from `playlist list`, and confirm it with your human."))
+    if kind and "id" in args:
+        args["id"], link.labels["id"] = resolve_name(link, kind, args["id"], example)
+    if cmd == "queue.add":
+        for named in ("album", "playlist"):
+            if named in args:
+                args[named], _label = resolve_name(link, named, args[named], example)
+    if cmd in QUEUE_ENTRY and "track_id" not in args:
+        args = {**args, **_queue_guard(link, args)}
+    params = COMMANDS[cmd].params
+    for field in ("track_id", "track_ids"):
+        if cmd in QUEUE_ENTRY:
+            break
+        if field not in params and field + "*" not in params:
+            continue
+        given = args.pop(field, None)
+        tokens = given if isinstance(given, list) else ([] if given is None else [given])
+        if not tokens and cmd in CURRENT_BY_DEFAULT:
+            tokens = ["current"]
+        if cmd == "play.track" and tokens:
+            url = URL.findall(str(tokens[0])) if _is_tidal_url(tokens[0]) else []
+            if url and url[-1][0] != "track":
+                return f"play.{url[-1][0]}", {"id": url[-1][1]}
+        if cmd == "queue.add" and len(tokens) == 1:
+            url = URL.findall(str(tokens[0])) if _is_tidal_url(tokens[0]) else []
+            if url and url[-1][0] != "track":
+                return cmd, {**args, url[-1][0]: url[-1][1]}
+        ids = [i for t in tokens for i in resolve_song(link, t)]
+        if ids:
+            args["track_id" if field == "track_id" else "track_ids"] = ids[0] if field == "track_id" else ids
+    return cmd, args
+
+
+def _preview_refetch(link: Link) -> None:
+    """What the y/N is about: refetch makes a request pair per song, hundreds for a big library."""
+    plan = link.ask("refetch.plan")
+    if not plan.get("ok"):
+        raise Stop(plan)
+    click.echo(_refetch_line("refetch.plan", plan["result"]))
+    if not plan["result"]["songs"]:
+        raise SystemExit(0)
+
+
+def run(cmd: str, args: dict, then=None, label=None) -> None:
+    from ticli.commands import COMMANDS
+    who = caller()
+    link = Link(who)
+    try:
+        try:
+            if who == AGENT:
+                guard(cmd, who, read=COMMANDS[cmd].read)
+            cmd, args = prepare(link, cmd, args)
+            if who == HUMAN and cmd == "refetch":
+                _preview_refetch(link)
+            if who == HUMAN and not confirmed(cmd, args, link.labels):
+                click.echo("cancelled", err=True)
+                raise SystemExit(1)
+            reply = link.ask(cmd, args)
+        except Stop as stop:
+            reply = stop.reply
+    finally:
+        link.close()
+    say(who, cmd, reply)
+    if then and who == HUMAN:
+        then()
+
+
+def verb(dotted: str, tokens) -> None:
+    from ticli import agent
+    try:
+        args = agent.form_args(dotted, tokens)
+    except ValueError as e:
+        raise fail(refusal("bad_args", str(e), f"See `ticli {dotted.replace('.', ' ')} --help`."))
+    run(dotted, args)
+
+
+def _saved_status() -> dict:
+    from ticli.commands import _disk_status
+    from ticli.utils.config import load_config
+    return _disk_status(load_config(), {})
+
+
+def transport(cmd: str) -> None:
+    """pause/resume/next/prev/status: never start the player just to answer. Only
+    `resume` with a saved track starts it: the human asked for music."""
+    from ticli.utils.config import load_config
+    who = caller()
+    try:
+        guard(cmd, who, read=cmd == "status")
+    except Stop as stop:
+        raise fail(stop.reply)
+    link = Link(who)
+    from_disk = cmd == "status" and who == AGENT and not load_config().get("allow_ai_control", True)
+    if not link.running() and not from_disk:
+        saved = _saved_status()
+        if cmd == "status" and saved.get("track"):
+            click.echo(status_line({"result": saved}).replace("paused:", "paused (saved):", 1))
+            raise SystemExit(0)
+        if not (cmd == "resume" and saved.get("track")):
+            click.echo("nothing playing")
+            raise SystemExit(0 if cmd == "status" else 1)
+    try:
+        say(who, cmd, link.ask(cmd, timeout=TRANSPORT_REPLY_SECONDS))
+    finally:
+        link.close()
+
+
+def _resume_saved(who: str):
+    """Resume what was playing: the running player's track, else the saved one (the
+    player starts for it). None when there is nothing to resume."""
+    link = Link(who)
+    try:
+        if link.running():
+            status = link.ask("status", timeout=TRANSPORT_REPLY_SECONDS)
+            track = ((status.get("state") or {}).get("track")
+                     or (status.get("result") or {}).get("track"))
+            if status.get("ok") and not track:
+                return None
+            if not status.get("ok"):
+                return status
+        elif not _saved_status().get("track"):
+            return None
+        return link.ask("resume", timeout=TRANSPORT_REPLY_SECONDS)
+    finally:
+        link.close()
+
+
+def play_saved() -> None:
+    """Bare `ticli play`: what `ticli resume` does, or "nothing to play"."""
+    who = caller()
+    try:
+        guard("resume", who)
+    except Stop as stop:
+        raise fail(stop.reply)
+    reply = _resume_saved(who)
+    if reply is None:
+        click.echo("nothing to play")
+        raise SystemExit(1)
+    say(who, "resume", reply)
+
+
+def start_saved(no_tui: bool) -> None:
+    """Bare `ticli start`: resume like bare `ticli play`, then the TUI; with nothing
+    to resume, just the TUI."""
+    who = caller()
+    try:
+        guard("resume", who)
+    except Stop as stop:
+        raise fail(stop.reply)
+    reply = _resume_saved(who)
+    if reply is not None:
+        say(who, "resume", reply)
+    if who == HUMAN and not no_tui:
+        _open_tui()
+
+
+def _open_tui() -> None:
+    root = click.get_current_context().find_root().params
+    from ticli.player import run_tui
+    run_tui(quality=root.get("quality"), login_flow=root.get("login_flow"))
+
+
+def search(words, types, limit, offset=0) -> None:
+    kinds = [f"{t}s" for t in types] if types else None
+    run("search", {"query": " ".join(words), **({"types": kinds} if kinds else {}),
+                   "limit": limit, **({"offset": offset} if offset else {})})
+
+
+def start(kind: str, name: str, no_tui: bool) -> None:
+    """Play a playlist, album or artist by name; then show the TUI unless --no-tui."""
+    who = caller()
+    link = Link(who)
+    try:
+        try:
+            if who == AGENT:
+                guard(f"play.{kind}", who)
+            ident, label = resolve_name(link, kind, name, f"ticli start {kind} 2")
+            reply = link.ask(f"play.{kind}", {"id": ident})
+        except Stop as stop:
+            reply = stop.reply
+            label = name
+    finally:
+        link.close()
+    if reply.get("ok") and not (reply.get("result") or {}).get("queued"):
+        click.echo(f'playing {kind} "{label}": {(reply["result"] or {}).get("queue_length", "?")} tracks')
+    else:
+        say(who, f"play.{kind}", reply)
+    if who == HUMAN and not no_tui and reply.get("ok"):
+        _open_tui()
+
+
+PLAY_ORDER = ("album", "playlist", "track", "artist")
+PLAY_URL = re.compile(r"(?:^|/)(track|album|playlist|artist|mix)/([0-9A-Za-z-]+)")
+
+
+def _play_target(link: Link, text: str, verb: str = "play") -> tuple:
+    """(kind, id, label) for free text: a TIDAL URL, a pick, one of your playlists by
+    exact name (0 requests), else one search across all four kinds. An exact name
+    wins (album, then playlist, track, artist); otherwise a single result does."""
+    if _is_tidal_url(text):
+        found = PLAY_URL.findall(text)
+        if found:
+            kind, ident = found[-1]
+            return kind, ident, text
+    picked = _take_pick(link.who, "any", text) if link.picks else None
+    if picked:
+        return picked["kind"], picked["id"], picked["name"]
+    if ID_FORM["playlist"].fullmatch(text):
+        return "playlist", text, text
+    if ID_FORM["album"].fullmatch(text):
+        return "id", text, text
+    wanted = text.casefold()
+    own = [p for p in _local_playlists(link.who) if p["name"].casefold() == wanted]
+    if len(own) == 1:
+        return "playlist", own[0]["id"], own[0]["name"]
+    if link.who == AGENT and not _ai_control():
+        raise Stop(refusal("not_found", f'None of your playlists is called "{text}".',
+                           "AI control is off, so TIDAL was not searched; pass an id."))
+    reply = link.ask("search", {"query": text, "types": list(PLAY_ORDER), "limit": TOP})
+    if not reply.get("ok"):
+        raise Stop(reply)
+    found = reply["result"] or {}
+    rows = [{"kind": k, "title": o.get("name") or o.get("title") or "", **_row(k, o)}
+            for k in PLAY_ORDER for o in found.get(k + "s", [])]
+    exact = [r for r in rows if r.pop("title").casefold() == wanted]
+    if exact or len(rows) == 1:
+        best = (exact or rows)[0]
+        return best["kind"], best["id"], best["name"]
+    if not rows:
+        raise Stop(refusal("not_found", f'Nothing on TIDAL matches "{text}".',
+                           f"Try `ticli search {text}`."))
+    rows = rows[:TOP]
+    if link.picks:
+        _save_picks(link.who, "any", rows)
+    if link.who == AGENT:
+        raise Stop(refusal("ambiguous", f'"{text}" matches several things.',
+                           "Run it again with one candidate's URL or id.", candidates=rows))
+    shown = "\n".join(f'  {i}. {r["kind"]}: {r["name"]}' for i, r in enumerate(rows, 1))
+    raise Stop(refusal("ambiguous", f'"{text}" matches several things:\n{shown}',
+                       f"Run `ticli {verb} 2` to pick."))
+
+
+def play(words) -> None:
+    """Play anything by name, URL or pick; one line, no TUI."""
+    text = " ".join(words).strip()
+    who = caller()
+    link = Link(who)
+    try:
+        try:
+            kind, ident, label = _play_target(link, text)
+            # A bare number is a track or an album id; TIDAL numbers both, so try the track first.
+            for kind in (("track", "album") if kind == "id" else (kind,)):
+                cmd = f"play.{kind}"
+                if who == AGENT:
+                    guard(cmd, who)
+                reply = link.ask(cmd, {"track_id": ident} if kind == "track" else {"id": ident})
+                if reply.get("ok") or reply.get("code") not in ("not_found", "api_error"):
+                    break
+        except Stop as stop:
+            reply, kind, label = stop.reply, "", text
+    finally:
+        link.close()
+    if reply.get("ok") and not (reply.get("result") or {}).get("queued"):
+        n = (reply.get("result") or {}).get("queue_length")
+        click.echo(f'playing {kind} "{label}"' + (f": {n} tracks" if n and kind != "track" else ""))
+    else:
+        say(who, f"play.{kind}" if kind else "play", reply)
+
+
+def _queue_args(kind: str, ident: str) -> dict:
+    if kind == "artist":
+        raise Stop(refusal("bad_args", "That is an artist; the queue takes songs, albums and playlists.",
+                           'Name a song ("artist - title"), an album or a playlist.'))
+    return {"track_ids": [ident]} if kind == "track" else {kind: ident}
+
+
+def queue(words, next_: bool) -> None:
+    """Add to the play queue by name, song, URL or pick, without replacing it."""
+    text = " ".join(words).strip()
+    who = caller()
+    link = Link(who)
+    where = {"position": "next" if next_ else "end"}
+    try:
+        try:
+            if who == AGENT:
+                guard("queue.add", who)
+            if " - " in text and not _is_tidal_url(text):
+                reply = link.ask("queue.add", {**where, "track_ids": resolve_song(link, text)})
+            else:
+                kind, ident, _label = _play_target(link, text, "queue")
+                # A bare number is a track or an album id; TIDAL numbers both, so try the track first.
+                first = None
+                for kind in (("track", "album") if kind == "id" else (kind,)):
+                    reply = link.ask("queue.add", {**where, **_queue_args(kind, ident)})
+                    if reply.get("ok") or reply.get("code") not in ("not_found", "api_error"):
+                        break
+                    first = first or reply
+                else:
+                    reply = first or reply
+        except Stop as stop:
+            reply = stop.reply
+    finally:
+        link.close()
+    say(who, "queue.add", reply)
+
+
+def restart(force: bool) -> None:
+    """`ticli restart`: a fresh player on the current code, resuming where it was."""
+    from ticli import ipc
+    root = click.get_current_context().find_root().params
+    reply = ipc.restart(root.get("quality"), root.get("login_flow"), force=force)
+    if not reply["ok"]:
+        raise fail(reply)
+    result = reply["result"]
+    if not result["running"]:
+        click.echo("the player is not running; it starts on the current code next time")
+    elif not result["restarted"]:
+        click.echo("the player did not restart")
+        raise SystemExit(1)
+    else:
+        click.echo("restarted the player" + ("; playback resumed" if result["playing"] else ""))
